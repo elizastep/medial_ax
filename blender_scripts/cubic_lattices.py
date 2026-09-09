@@ -16,8 +16,9 @@ bl_info = {
 #   2. Tick "Fit to object" (and "Cull to inside" for closed meshes), pick BCC/FCC/SC, adjust the
 #      spacing.  Defaults already produce the lattice with all its bonds and the Voronoi walls.
 #   3. With the lattice selected, press "Export for mars (.obj)".  Both objects go into one file:
-#      `<kind>_lattice` (points + edges) and `<kind>_voronoi` (faces).  mars-cli links every
-#      Voronoi wall to the grid edge it bisects; run `mars-cli grid-check file.obj` to see how.
+#      `<kind>_lattice` (points + edges) and `DUAL_MESH_<kind>` (faces).  mars-cli reads the
+#      object whose name starts with DUAL_MESH as the dual of the grid, and the medial axis
+#      faces it writes are the Voronoi walls rather than inferred axis-aligned quads.
 
 import itertools
 import math
@@ -447,6 +448,47 @@ def point_in_mesh(ob, point):
     return True
 
 
+# Object naming.  mars-cli recognises the dual by name: an `o` object whose name starts with
+# DUAL_MESH (case-insensitive, so Blender's `.001` suffix is fine) is read as the dual mesh of
+# the grid, everything else as the grid itself.  Keep DUAL_PREFIX in sync with
+# `DUAL_MESH_OBJECT` in mars-core/src/grid.rs.
+LATTICE_SUFFIX = "_lattice"
+DUAL_PREFIX = "DUAL_MESH_"
+
+
+def lattice_name(kind):
+    return "%s%s" % (kind, LATTICE_SUFFIX)
+
+
+def dual_name(kind):
+    return "%s%s" % (DUAL_PREFIX, kind)
+
+
+def _split_dup_suffix(name):
+    """`"DUAL_MESH_BCC.001"` -> `("DUAL_MESH_BCC", ".001")`."""
+    base, dot, num = name.partition(".")
+    return base, dot + num
+
+
+def is_lattice_name(name):
+    return _split_dup_suffix(name)[0].endswith(LATTICE_SUFFIX)
+
+
+def is_dual_name(name):
+    return _split_dup_suffix(name)[0].upper().startswith(DUAL_PREFIX)
+
+
+def partner_name(name):
+    """The name of the other half of the pair, keeping any `.001` suffix.  None if `name` is
+    neither a lattice nor a dual object."""
+    base, dup = _split_dup_suffix(name)
+    if base.endswith(LATTICE_SUFFIX):
+        return dual_name(base[:-len(LATTICE_SUFFIX)]) + dup
+    if base.upper().startswith(DUAL_PREFIX):
+        return lattice_name(base[len(DUAL_PREFIX):]) + dup
+    return None
+
+
 def _new_object(context, name, verts, edges=(), faces=(), location=(0.0, 0.0, 0.0)):
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(list(verts), list(edges), list(faces))
@@ -523,7 +565,7 @@ def build_lattice(context, kind, a, nx, ny, nz, bonds, second_shell,
                     used.add(tuple(sorted((f[m], f[(m + 1) % len(f)]))))
             edges = [e for e in edges if e not in used]
 
-    obj = _new_object(context, "%s_lattice" % kind, verts, edges, faces, location=origin)
+    obj = _new_object(context, lattice_name(kind), verts, edges, faces, location=origin)
     counts[1], counts[2] = len(edges), len(faces)
 
     if spheres and delaunay_mode != 'CELLS':
@@ -549,7 +591,7 @@ def build_lattice(context, kind, a, nx, ny, nz, bonds, second_shell,
         # it is created at the parent's local origin (not at `origin` again: the parent's
         # matrix_world is not evaluated yet at this point, so a parent-inverse would be stale
         # and the child would end up translated twice).
-        vobj = _new_object(context, "%s_voronoi" % kind, vv, (), vfaces)
+        vobj = _new_object(context, dual_name(kind), vv, (), vfaces)
         if voronoi_mode == 'SINGLE':
             vobj.display_type = 'WIRE'
         vobj.parent = obj
@@ -658,7 +700,7 @@ class MESH_OT_add_cubic_lattice(bpy.types.Operator):
         default='MOSAIC',
         description="Faces of the Voronoi tessellation: truncated octahedra for "
                     "BCC, rhombic dodecahedra for FCC, cubes for SC. Written into "
-                    "a separate <lattice>_voronoi object. mars-cli needs 'All faces'",
+                    "a separate DUAL_MESH_<kind> object. mars-cli needs 'All faces'",
     )
     outer_walls: BoolProperty(
         name="Outer Voronoi walls",
@@ -752,7 +794,7 @@ class MESH_OT_add_cubic_lattice(bpy.types.Operator):
         self.location = context.scene.cursor.location
         ob = context.active_object
         if (ob is not None and ob.type == 'MESH' and not self.target_object
-                and not ob.name.split(".")[0].endswith(("_lattice", "_voronoi"))):
+                and not is_lattice_name(ob.name) and not is_dual_name(ob.name)):
             self.target_object = ob.name
         return self.execute(context)
 
@@ -839,19 +881,19 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
 
     @staticmethod
     def _objects(context):
-        """The meshes to export: the selected ones, their `_voronoi` children and `_lattice`
-        parents, and the `<name>_voronoi` / `<name>_lattice` partner by name, in case the
+        """The meshes to export: the selected ones, their dual children and lattice
+        parents, and the `<kind>_lattice` / `DUAL_MESH_<kind>` partner by name, in case the
         parenting was cleared."""
         objs = {o for o in context.selected_objects if o.type == 'MESH'}
         for o in list(objs):
             objs.update(c for c in o.children if c.type == 'MESH')
             if o.parent is not None and o.parent.type == 'MESH':
                 objs.add(o.parent)
-            for a, b in (("_lattice", "_voronoi"), ("_voronoi", "_lattice")):
-                if a in o.name:
-                    partner = context.scene.objects.get(o.name.replace(a, b, 1))
-                    if partner is not None and partner.type == 'MESH':
-                        objs.add(partner)
+            name = partner_name(o.name)
+            if name is not None:
+                partner = context.scene.objects.get(name)
+                if partner is not None and partner.type == 'MESH':
+                    objs.add(partner)
         return objs
 
     def draw(self, context):
@@ -864,7 +906,8 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
     def invoke(self, context, event):
         if not self.filepath:
             ob = context.active_object
-            name = ob.name.split(".")[0].replace("_voronoi", "") if ob else "lattice"
+            base = _split_dup_suffix(ob.name)[0] if ob else "lattice"
+            name = partner_name(base) if is_dual_name(base) else base
             self.filepath = bpy.path.ensure_ext(name, ".obj")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
@@ -878,11 +921,11 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
         if not any(len(o.data.polygons) for o in objs):
             self.report({'ERROR'},
                         "No Voronoi object among [%s]. Regenerate the lattice with Voronoi "
-                        "faces = All faces (F9 panel), or select the <kind>_voronoi object "
-                        "as well" % names)
+                        "faces = All faces (F9 panel), or select the %s<kind> object "
+                        "as well" % (names, DUAL_PREFIX))
             return {'CANCELLED'}
         for o in objs:
-            if "_lattice" in o.name and len(o.data.polygons):
+            if is_lattice_name(o.name) and len(o.data.polygons):
                 self.report({'WARNING'},
                             "%s has faces; mars-cli ignores faces on the lattice object and "
                             "Blender drops the edges they cover. Regenerate with Delaunay "
