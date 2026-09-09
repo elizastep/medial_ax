@@ -348,6 +348,34 @@ impl Bbox {
     }
 }
 
+/// Name of the object holding the dual mesh, inside the .obj of a grid mesh.
+pub const DUAL_MESH_OBJECT: &str = "DUAL_MESH";
+
+/// Whether an .obj object name marks the dual mesh.
+fn is_dual_object(name: &str) -> bool {
+    name.trim()
+        .to_ascii_uppercase()
+        .starts_with(DUAL_MESH_OBJECT)
+}
+
+/// Resolve one .obj vertex reference: 1-based, counting back from the end when negative, and
+/// possibly carrying the texture and normal indices that we have no use for.
+fn vertex_ref(token: &str, num_vertices: usize) -> Result<usize, String> {
+    let field = token.split('/').next().unwrap_or(token);
+    let i = field
+        .parse::<isize>()
+        .map_err(|e| format!("{}: {}", token, e))?;
+    let i = if i < 0 {
+        num_vertices as isize + i
+    } else {
+        i - 1
+    };
+    if i < 0 || num_vertices as isize <= i {
+        return Err(format!("vertex reference {} is out of range", token));
+    }
+    Ok(i as usize)
+}
+
 /// A single triangle of a [DualMesh] face, in the form used by the intersection test.
 #[derive(Clone, Debug)]
 struct Tri {
@@ -443,68 +471,6 @@ pub struct DualMesh {
 }
 
 impl DualMesh {
-    /// Read a dual mesh from the contents of an .obj file.
-    pub fn read_from_obj_string(s: &str) -> Result<Self, String> {
-        let mut points: Vec<Pos> = Vec::new();
-        let mut faces: Vec<Vec<u32>> = Vec::new();
-
-        for (line_no, line) in s.lines().enumerate() {
-            let mut tokens = line.trim().split_ascii_whitespace();
-            let Some(kind) = tokens.next() else {
-                continue;
-            };
-
-            let err = |what: &str| format!("dual mesh, line {}: {}", line_no + 1, what);
-
-            match kind {
-                "v" => {
-                    let mut c = [0.0; 3];
-                    for j in 0..3 {
-                        c[j] = tokens
-                            .next()
-                            .ok_or_else(|| err("vertex needs three coordinates"))?
-                            .parse::<f64>()
-                            .map_err(|e| err(&e.to_string()))?;
-                    }
-                    points.push(Pos(c));
-                }
-                "f" => {
-                    let mut face = Vec::new();
-                    for tok in tokens {
-                        // `f 1`, `f 1/2`, `f 1/2/3` and `f 1//3` all mean vertex 1 here.
-                        let vs = tok.split('/').next().unwrap_or(tok);
-                        let i = vs.parse::<isize>().map_err(|e| err(&e.to_string()))?;
-                        // .obj indices are 1-based, and negative ones count back from the end.
-                        let i = if i < 0 {
-                            points.len() as isize + i
-                        } else {
-                            i - 1
-                        };
-                        if i < 0 || points.len() as isize <= i {
-                            return Err(err(&format!("face index {} out of range", i + 1)));
-                        }
-                        face.push(i as u32);
-                    }
-                    if face.len() < 3 {
-                        return Err(err("face needs at least three vertices"));
-                    }
-                    faces.push(face);
-                }
-                _ => continue,
-            }
-        }
-
-        if faces.is_empty() {
-            return Err("dual mesh has no faces".to_string());
-        }
-
-        Ok(Self {
-            points,
-            faces,
-            tree: None,
-        })
-    }
-
     pub fn num_faces(&self) -> usize {
         self.faces.len()
     }
@@ -886,49 +852,107 @@ impl VineyardsGridMesh {
         }
     }
 
+    /// Read a grid mesh from the contents of an .obj file.
+    ///
+    /// The grid is the vertices and edges of the file. If the file also
+    /// contains an object named [DUAL_MESH_OBJECT], the vertices and faces of
+    /// that object are read as the dual mesh of the grid; see [DualMesh].
     pub fn read_from_obj_string(s: &str) -> Result<Self, String> {
+        // Which of the two meshes each vertex went to, and where it landed there.  An .obj
+        // numbers its vertices across the whole file, but we split them between the grid and the
+        // dual, so references have to be translated.
+        enum Vertex {
+            Grid(isize),
+            Dual(u32),
+        }
+
+        let mut vertices: Vec<Vertex> = Vec::new();
         let mut points: Vec<Pos> = Vec::new();
         let mut edges: Vec<(isize, isize)> = Vec::new();
+        let mut dual_points: Vec<Pos> = Vec::new();
+        let mut dual_faces: Vec<Vec<u32>> = Vec::new();
 
-        for line in s.lines() {
-            let line = line.trim();
-            if line.starts_with("#")
-                || line.starts_with("mtllib")
-                || line.starts_with("o")
-                || line.starts_with("s")
-            {
+        let mut in_dual = false;
+        let mut saw_dual_object = false;
+
+        for (line_no, line) in s.lines().enumerate() {
+            let mut tokens = line.trim().split_ascii_whitespace();
+            let Some(kind) = tokens.next() else {
                 continue;
-            } else if line.starts_with("v") {
-                let groups = line.split_ascii_whitespace().collect::<Vec<_>>();
-                let x = groups
-                    .get(1)
-                    .ok_or("missing field".to_string())
-                    .and_then(|n| n.parse::<f64>().map_err(|e| e.to_string()))?;
-                let y = groups
-                    .get(2)
-                    .ok_or("missing field".to_string())
-                    .and_then(|n| n.parse::<f64>().map_err(|e| e.to_string()))?;
-                let z = groups
-                    .get(3)
-                    .ok_or("missing field".to_string())
-                    .and_then(|n| n.parse::<f64>().map_err(|e| e.to_string()))?;
-                let coords = Pos([x, y, z]);
-                points.push(coords);
-            } else if line.starts_with("l") {
-                let groups = line.split_ascii_whitespace().collect::<Vec<_>>();
-                let from = groups
-                    .get(1)
-                    .ok_or("missing field".to_string())
-                    .and_then(|n| n.parse::<isize>().map_err(|e| e.to_string()))?;
-                let to = groups
-                    .get(2)
-                    .ok_or("missing field".to_string())
-                    .and_then(|n| n.parse::<isize>().map_err(|e| e.to_string()))?;
-                edges.push((from - 1, to - 1));
+            };
+            let at = |what: String| format!("line {}: {}", line_no + 1, what);
+
+            match kind {
+                // Only `o` switches object, since that is what Blender writes.
+                "o" => {
+                    in_dual = tokens.next().map(is_dual_object).unwrap_or(false);
+                    saw_dual_object |= in_dual;
+                }
+
+                "v" => {
+                    let mut c = [0.0; 3];
+                    for coord in c.iter_mut() {
+                        *coord = tokens
+                            .next()
+                            .ok_or_else(|| at("a vertex needs three coordinates".to_string()))?
+                            .parse::<f64>()
+                            .map_err(|e| at(e.to_string()))?;
+                    }
+                    let p = Pos(c);
+                    if in_dual {
+                        vertices.push(Vertex::Dual(dual_points.len() as u32));
+                        dual_points.push(p);
+                    } else {
+                        vertices.push(Vertex::Grid(points.len() as isize));
+                        points.push(p);
+                    }
+                }
+
+                // A polyline of two or more vertices, so one edge per consecutive pair.
+                "l" => {
+                    let mut prev = None;
+                    for tok in tokens {
+                        let i = vertex_ref(tok, vertices.len()).map_err(at)?;
+                        let Vertex::Grid(i) = vertices[i] else {
+                            return Err(at("an edge refers to a vertex of the dual mesh".into()));
+                        };
+                        if let Some(p) = prev.replace(i) {
+                            edges.push((p, i));
+                        }
+                    }
+                    if prev.is_none() {
+                        return Err(at("an edge needs at least two vertices".to_string()));
+                    }
+                }
+
+                // Faces only mean something inside the dual object: a grid mesh has none.
+                "f" if in_dual => {
+                    let mut face = Vec::new();
+                    for tok in tokens {
+                        let i = vertex_ref(tok, vertices.len()).map_err(at)?;
+                        let Vertex::Dual(i) = vertices[i] else {
+                            return Err(at("a dual face refers to a vertex of the grid".into()));
+                        };
+                        face.push(i);
+                    }
+                    if face.len() < 3 {
+                        return Err(at("a dual face needs at least three vertices".to_string()));
+                    }
+                    dual_faces.push(face);
+                }
+
+                _ => continue,
             }
         }
 
-        // Check that no two vertices are actually the same vertex
+        if saw_dual_object && dual_faces.is_empty() {
+            return Err(format!(
+                "the .obj has an object named {}, but it has no faces",
+                DUAL_MESH_OBJECT
+            ));
+        }
+
+        // Check that no two grid vertices are actually the same vertex.
         for i in 0..points.len() {
             for j in (i + 1)..points.len() {
                 let p = points[i];
@@ -972,12 +996,18 @@ impl VineyardsGridMesh {
             neighbors[to as usize].push(from);
         }
 
+        let dual = (!dual_faces.is_empty()).then_some(DualMesh {
+            points: dual_points,
+            faces: dual_faces,
+            tree: None,
+        });
+
         Ok(Self {
             points,
             neighbors,
             r#type: "meshgrid".to_string(),
             dim_dist,
-            dual: None,
+            dual,
         })
     }
 
@@ -1383,45 +1413,120 @@ mod dual_tests {
     }
 
     #[test]
-    fn dual_obj_parser_handles_blender_output() {
-        // Normals and texture coordinates must not be mistaken for vertices, faces may name them,
-        // and negative indices count back from the end.
+    fn one_obj_holds_both_the_grid_and_its_dual() {
+        // Two objects in one file: vertices are numbered across the whole file, `vn`/`vt` must
+        // not be mistaken for vertices, faces may name them, and negative indices are relative.
         let obj = "\
-# a comment
+# a grid and its dual
 mtllib whatever.mtl
-o Cell
+o GridObject
 v 0 0 0
 v 1 0 0
-v 1 1 0
-v 0 1 0
+l 1 2
+o DUAL_MESH.001
+v 0.5 -1 -1
+v 0.5 1 -1
+v 0.5 1 1
+v 0.5 -1 1
 vt 0.5 0.5
-vn 0.0 0.0 1.0
+vn 1.0 0.0 0.0
 usemtl Material
 s off
-f 1/1/1 2/1/1 3/1/1 4/1/1
-f -4 -3 -2
+f 3/1/1 4/1/1 5/1/1 6/1/1
+v 9 -1 -1
+v 9 1 -1
+v 9 1 1
+f -3 -2 -1
 ";
-        let dual = DualMesh::read_from_obj_string(obj).expect("should parse");
-        assert_eq!(dual.points.len(), 4, "vn/vt must not become points");
+        let mut grid = VineyardsGridMesh::read_from_obj_string(obj).expect("should parse");
+
+        assert_eq!(
+            grid.points.len(),
+            2,
+            "only the grid object's vertices are grid points"
+        );
+        assert_eq!(grid.neighbors[0], vec![1]);
+        let dual = grid
+            .dual
+            .as_ref()
+            .expect("the DUAL_MESH object is the dual");
+        assert_eq!(dual.points.len(), 7, "vn/vt must not become points");
         assert_eq!(dual.faces.len(), 2);
-        assert_eq!(dual.faces[0], vec![0, 1, 2, 3]);
+        assert_eq!(
+            dual.faces[0],
+            vec![0, 1, 2, 3],
+            "face indices are file-wide, but the dual's points are not"
+        );
         assert_eq!(
             dual.faces[1],
-            vec![0, 1, 2],
+            vec![4, 5, 6],
             "negative indices are relative"
         );
 
-        assert!(
-            DualMesh::read_from_obj_string("v 0 0 0\n").is_err(),
-            "no faces"
-        );
-        assert!(
-            DualMesh::read_from_obj_string("v 0 0 0\nf 1 2\n").is_err(),
-            "2-gon"
-        );
-        assert!(
-            DualMesh::read_from_obj_string("v 0 0 0\nf 1 2 9\n").is_err(),
-            "out of range"
-        );
+        // And the one grid edge finds the quad between its endpoints.
+        let face = grid
+            .dual_face_points(Index::fake(0), Index::fake(1))
+            .expect("the edge crosses the dual face");
+        assert_eq!(face.len(), 4);
+        assert!(centroid(&face).dist(&Pos([0.5, 0.0, 0.0])) < 1e-9);
+    }
+
+    #[test]
+    fn a_grid_obj_without_a_dual_object_still_reads() {
+        let obj = "o GridObject\nv 0 0 0\nv 1 0 0\nl 1 2\n";
+        let grid = VineyardsGridMesh::read_from_obj_string(obj).expect("should parse");
+        assert_eq!(grid.points.len(), 2);
+        assert!(grid.dual.is_none(), "no DUAL_MESH object means no dual");
+    }
+
+    #[test]
+    fn malformed_input_is_rejected() {
+        let cases = [
+            // A dual object that holds no faces is a mistake worth reporting.
+            ("o DUAL_MESH\nv 0 0 0\nv 1 0 0\n", "no faces"),
+            // Faces and edges may not reach across from one object into the other.
+            (
+                "o g\nv 0 0 0\nv 1 0 0\nv 2 0 0\no DUAL_MESH\nv 3 0 0\nf 1 2 4\n",
+                "crossing face",
+            ),
+            (
+                "o g\nv 0 0 0\no DUAL_MESH\nv 1 0 0\nv 2 0 0\nv 3 0 0\nf 2 3 4\nl 1 2\n",
+                "crossing edge",
+            ),
+            // Out of range, and degenerate faces.
+            ("o DUAL_MESH\nv 0 0 0\nf 1 2 9\n", "out of range"),
+            ("o DUAL_MESH\nv 0 0 0\nv 1 0 0\nf 1 2\n", "2-gon"),
+            // Two grid vertices in the same place: still rejected, as before.
+            ("v 0 0 0\nv 0 0 0\n", "duplicate grid vertices"),
+        ];
+        for (obj, what) in cases {
+            assert!(
+                VineyardsGridMesh::read_from_obj_string(obj).is_err(),
+                "should have been rejected: {}",
+                what
+            );
+        }
+    }
+
+    /// A dual whose cells are separate closed polyhedra has coincident corners by construction,
+    /// which the grid itself is not allowed to have.
+    #[test]
+    fn coincident_dual_corners_are_allowed() {
+        let obj = "\
+o GridObject
+v 0 0 0
+v 1 0 0
+o DUAL_MESH
+v 0.5 -1 -1
+v 0.5 1 -1
+v 0.5 1 1
+v 0.5 -1 -1
+v 0.5 1 -1
+v 0.5 1 1
+f 3 4 5
+f 6 7 8
+";
+        let grid = VineyardsGridMesh::read_from_obj_string(obj).expect("should parse");
+        assert_eq!(grid.dual.as_ref().unwrap().faces.len(), 2);
     }
 }

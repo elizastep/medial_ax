@@ -153,15 +153,25 @@ Without a dual mesh, the medial axis face for a grid edge is an axis-aligned qua
 grid spacing that we infer from the .obj.  That is only the right shape when the grid is a cubic
 one, but not in general.
 
-For other grids, pass the dual of the grid as a second .obj with `-d`:
+For those, put the dual of the grid in the same .obj as a second object named `DUAL_MESH`:
 
-```sh
-mars-cli run complex.obj -m lattice.obj -d dual.obj -s -o output
+```
+o GridObject
+v ...            <- the grid points
+l ...            <- the grid edges
+o DUAL_MESH
+v ...            <- the corners of the dual faces
+f ...            <- the dual faces
 ```
 
-The medial axes written by `mars-cli obj` are then made of the faces from `dual.obj`.  We assume
-that each edge in `lattice.obj` intersects at most one face in `dual.obj` and that those edges and
-faces correspond to each other.  This is only true for certain dual meshes.
+The medial axes written by `mars-cli obj` are then made of the real dual faces.
+What we need from the dual:
+
+- The faces must be **convex**, and each grid edge must cross **at most one** of them.  Both hold
+  for the Voronoi diagram of a lattice.
+- Faces may be polygons or triangulated, and the cells may share their corners or each be a
+  separate closed polyhedron.  Any of those work.
+- The name is matched ignoring case and on the prefix, so Blender's `DUAL_MESH.001` is fine.
 
 # What's happening on the inside
 

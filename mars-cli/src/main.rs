@@ -2,7 +2,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use mars_core::{
     complex::Complex,
-    grid::{DualMesh, Index, VineyardsGridMesh},
+    grid::{Index, VineyardsGridMesh, DUAL_MESH_OBJECT},
     stats::{MarsMem, ReductionMem},
     Grid, Mars, PruningParam, Swap,
 };
@@ -59,20 +59,12 @@ struct RunArgs {
     #[arg(
         short,
         long,
-        help = "Path to the .obj file for a grid mesh.",
+        help = "Path to the .obj file for a grid mesh.  If the file also holds an object \
+                named DUAL_MESH, that object is read as the dual mesh of the grid, and the medial \
+                axis faces are its faces rather than quads inferred from the grid spacing.",
         value_name = "mesh.obj"
     )]
     mesh_path: PathBuf,
-
-    #[arg(
-        short,
-        long,
-        help = "Path to the .obj file for the dual mesh of the grid.  The output axes will use faces\
-                from this grid.  We assume each edge in the mesh-path only intersects it's\
-                corresponding face in the dual mesh.",
-        value_name = "dual.obj"
-    )]
-    dual_path: Option<PathBuf>,
 
     #[arg(short, long, help = "Number of threads to run in parallel.")]
     threads: Option<usize>,
@@ -445,42 +437,41 @@ fn warn_missing_dual_faces(missing: usize) {
 }
 
 /// Read the grid mesh, and attach its dual mesh if one was given.
-fn load_mesh_grid(mesh_path: &Path, dual_path: Option<&Path>) -> Result<VineyardsGridMesh> {
+fn load_mesh_grid(mesh_path: &Path) -> Result<VineyardsGridMesh> {
     let obj_string = std::fs::read_to_string(mesh_path)
         .with_context(|| format!("failed to read mesh path: {:?}", mesh_path))?;
     let mut mesh_grid = VineyardsGridMesh::read_from_obj_string(&obj_string)
         .map_err(|e| anyhow!(e))
         .context("failed to read grid mesh")?;
 
-    let Some(dual_path) = dual_path else {
+    let Some(ref dual) = mesh_grid.dual else {
+        info!(
+            "no {} object in {:?}: the medial axis faces will be quads inferred from the grid \
+             spacing",
+            DUAL_MESH_OBJECT, mesh_path
+        );
         return Ok(mesh_grid);
     };
-
-    let dual_string = std::fs::read_to_string(dual_path)
-        .with_context(|| format!("failed to read dual path: {:?}", dual_path))?;
-    let dual = DualMesh::read_from_obj_string(&dual_string)
-        .map_err(|e| anyhow!(e))
-        .context("failed to read dual mesh")?;
     info!(
         "read dual mesh: #v={} #f={}",
         dual.points.len(),
         dual.num_faces()
     );
-    mesh_grid.dual = Some(dual);
 
     // Which dual face belongs to which grid edge is worked out lazily, in
-    // `mars-cli obj`. So check up front that the two files line up: otherwise a
-    // mismatched pair only shows up as an empty medial axis, after the entire
-    // run has finished.
+    // `mars-cli obj`. So check up front that the grid and its dual line up:
+    // otherwise a mismatch only shows up as an empty medial axis, after the
+    // entire run has finished.
     let (checked, hit) = sample_dual_hits(&mut mesh_grid, 64);
     if checked == 0 {
         bail!("the grid mesh has no edges");
     }
     if hit == 0 {
         bail!(
-            "none of the {} sampled grid edges cross a face of the dual mesh. Are the two .obj \
-             files in the same coordinate system?",
-            checked
+            "none of the {} sampled grid edges cross a face of the {} object. Is the dual \
+             mesh in the same coordinate system as the grid?",
+            checked,
+            DUAL_MESH_OBJECT
         );
     }
     info!(
@@ -710,7 +701,7 @@ impl RunArgs {
             .context("failed to read complex")
             .unwrap();
 
-        let mesh_grid = load_mesh_grid(&self.mesh_path, self.dual_path.as_deref())?;
+        let mesh_grid = load_mesh_grid(&self.mesh_path)?;
 
         let mars = mars_core::Mars {
             complex: Some(complex),
@@ -779,7 +770,7 @@ fn run(args: &RunArgs) -> Result<()> {
         .context("failed to read complex")
         .unwrap();
 
-    let mesh_grid = load_mesh_grid(&args.mesh_path, args.dual_path.as_deref())?;
+    let mesh_grid = load_mesh_grid(&args.mesh_path)?;
 
     let mars = mars_core::Mars {
         complex: Some(complex),
