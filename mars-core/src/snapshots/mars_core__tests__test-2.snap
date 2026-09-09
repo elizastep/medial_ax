@@ -1,0 +1,5 @@
+---
+source: mars-core/src/lib.rs
+expression: reduction.R(dim).__str__()
+---
+|×                                                                                                 |

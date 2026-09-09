@@ -1,0 +1,5 @@
+---
+source: mars-core/src/sneaky_matrix.rs
+expression: boundary.__str__()
+---
+|×                                                                                                 |

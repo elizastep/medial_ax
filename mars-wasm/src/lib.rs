@@ -316,7 +316,7 @@ impl Api {
     /// Flattened coordinates for every face of the computed medial axes, GL style.
     pub fn medial_axes_face_positions(&mut self, dim: usize) -> Result<Vec<f32>, String> {
         let mut out: Vec<f64> = Vec::new();
-        let Some(ref mut g) = self.core.grid else {
+        let Some(ref g) = self.core.grid else {
             return Ok(Vec::new());
         };
         let Some(ref v) = self.vineyards else {
@@ -326,24 +326,28 @@ impl Api {
         let swaps = self.pruned_swaps[dim].as_ref().map(|(_, s)| s);
         let swaps = swaps.unwrap_or(&v.swaps[dim]);
 
+        // Fan triangulation of each (convex) dual face.  For a quad [a, b, c, d] this gives
+        // [a, b, c, a, c, d], which is what the frontend has always received.
+        let mut push_fan = |pts: &[mars_core::complex::Pos]| {
+            for k in 1..pts.len().saturating_sub(1) {
+                for p in [pts[0], pts[k], pts[k + 1]] {
+                    out.extend_from_slice(&[p.x(), p.y(), p.z()]);
+                }
+            }
+        };
+
         match g {
             Grid::Regular(grid) => {
                 for s in swaps {
                     if 0 < s.2.v.len() {
-                        let [a, b, c, d] = grid.dual_quad_points(s.0, s.1);
-                        for p in &[a, b, c, a, c, d] {
-                            out.extend_from_slice(&[p.x(), p.y(), p.z()]);
-                        }
+                        push_fan(&grid.dual_quad_points(s.0, s.1));
                     }
                 }
             }
-            Grid::Mesh(ref mut grid) => {
+            Grid::Mesh(grid) => {
                 for s in swaps {
                     if 0 < s.2.v.len() {
-                        let [a, b, c, d] = grid.dual_quad_points(s.0, s.1);
-                        for p in &[a, b, c, a, c, d] {
-                            out.extend_from_slice(&[p.x(), p.y(), p.z()]);
-                        }
+                        push_fan(&grid.dual_face_points(s.0, s.1));
                     }
                 }
             }
@@ -362,19 +366,27 @@ impl Api {
         let Some(ref v) = self.vineyards else {
             return Err("Missing vineyards")?;
         };
-        let face_index = face_index & !1;
+        let Some(ref g) = self.core.grid else {
+            return Err("Missing grid")?;
+        };
 
         let swaps = self.pruned_swaps[dim].as_ref().map(|(_, s)| s);
         let swaps = swaps.unwrap_or(&v.swaps[dim]);
 
-        let mut i = 0;
+        // Walk the faces in the order of `medial_axes_face_positions`, counting the triangles
+        // each one was fanned into.
+        let mut first_triangle = 0;
         for s in swaps {
             if 0 < s.2.v.len() {
-                if i == face_index || i + 1 == face_index {
+                let triangles = match g {
+                    Grid::Regular(_) => 2,
+                    Grid::Mesh(grid) => grid.dual_face_points(s.0, s.1).len().saturating_sub(2),
+                };
+                if face_index < first_triangle + triangles {
                     return serde_wasm_bindgen::to_value(&(s.0, s.1, &s.2.v))
                         .map_err(|e| e.to_string());
                 }
-                i += 2;
+                first_triangle += triangles;
             }
         }
 

@@ -30,6 +30,20 @@ impl Pos {
     pub fn dist(&self, other: &Pos) -> f64 {
         self.dist2(other).sqrt()
     }
+
+    pub fn dot(&self, other: &Pos) -> f64 {
+        self.0[0] * other.0[0] + self.0[1] * other.0[1] + self.0[2] * other.0[2]
+    }
+
+    pub fn cross(&self, other: &Pos) -> Pos {
+        let [ax, ay, az] = self.0;
+        let [bx, by, bz] = other.0;
+        Pos([ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx])
+    }
+
+    pub fn norm(&self) -> f64 {
+        self.dot(self).sqrt()
+    }
 }
 
 impl std::fmt::Debug for Pos {

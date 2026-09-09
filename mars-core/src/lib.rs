@@ -1838,4 +1838,133 @@ mod tests {
             insta::assert_json_snapshot!(pairs);
         }
     }
+
+    /// Endpoint positions of a swap-bearing grid edge, rounded, ordered, plus the number of
+    /// vertices of its dual face.  Comparable across grid representations.
+    fn edge_signature(pa: Pos, pb: Pos, face_vertices: usize) -> ([i64; 3], [i64; 3], usize) {
+        let key = |p: Pos| {
+            [
+                (p.x() * 1e6).round() as i64,
+                (p.y() * 1e6).round() as i64,
+                (p.z() * 1e6).round() as i64,
+            ]
+        };
+        let (a, b) = (key(pa), key(pb));
+        if a <= b {
+            (a, b, face_vertices)
+        } else {
+            (b, a, face_vertices)
+        }
+    }
+
+    fn run_and_prune_mesh(mars: &Mars) -> [Vec<([i64; 3], [i64; 3], usize)>; 3] {
+        let no_progress = |_, _| {};
+        let vin = mars.run(&no_progress).expect("failed to run mars");
+        let Some(Grid::Mesh(ref grid)) = mars.grid else {
+            unreachable!()
+        };
+        let complex = mars.complex.as_ref().unwrap();
+        let mut out = [Vec::new(), Vec::new(), Vec::new()];
+        for dim in 0..3 {
+            let pruned = vin.prune_dim(dim, &default_pruning_param(dim), complex, no_progress);
+            let mut sigs: Vec<_> = pruned
+                .iter()
+                .filter(|t| t.2.v.len() > 0)
+                .map(|(i, j, _)| {
+                    edge_signature(
+                        grid.coordinate(*i),
+                        grid.coordinate(*j),
+                        grid.dual_face_points(*i, *j).len(),
+                    )
+                })
+                .collect();
+            sigs.sort();
+            sigs.dedup();
+            out[dim] = sigs;
+        }
+        out
+    }
+
+    /// The mesh-grid path on a simple cubic block must find the same swap-bearing edges as the
+    /// regular grid on the same points.  The grid is placed in generic position: with
+    /// [test_grid_for_cube] the grid points lie on the cube's symmetry planes, ties between
+    /// simplex values are then resolved differently depending on the traversal direction, and
+    /// a handful of edges differ between the BFS of the regular grid and the DFS of the mesh.
+    #[test]
+    fn mesh_grid_matches_regular_grid_on_cube() {
+        let complex = test_complex_cube();
+        let regular = grid::VineyardsGrid::new(Pos([-0.5137, -0.4871, -0.5023]), 0.4123, [5, 5, 5]);
+        let mars = Mars {
+            complex: Some(complex.clone()),
+            grid: Some(Grid::Regular(regular.clone())),
+        };
+        let no_progress = |_, _| {};
+        let vin = mars.run(&no_progress).expect("failed to run mars");
+        let mut expected = [Vec::new(), Vec::new(), Vec::new()];
+        for dim in 0..3 {
+            let pruned = vin.prune_dim(dim, &default_pruning_param(dim), &complex, no_progress);
+            let mut sigs: Vec<_> = pruned
+                .iter()
+                .filter(|t| t.2.v.len() > 0)
+                .map(|(i, j, _)| edge_signature(regular.coordinate(*i), regular.coordinate(*j), 4))
+                .collect();
+            sigs.sort();
+            sigs.dedup();
+            expected[dim] = sigs;
+        }
+
+        // shape [5; 3] == 4 cells of side `size`, centred two cells in from the corner.
+        let centre = regular.corner + Pos([2.0 * regular.size; 3]);
+        let block = lattice_block(Lattice::Sc, [4, 4, 4], regular.size, centre);
+        let obj = block_to_obj(
+            &block,
+            &ObjOptions {
+                lines: Lines::Shell1,
+                ..Default::default()
+            },
+        );
+        let grid = grid::VineyardsGridMesh::read_from_obj_string(&obj).unwrap();
+        assert_eq!(grid.points.len(), 125);
+        let mars = Mars {
+            complex: Some(complex),
+            grid: Some(Grid::Mesh(grid)),
+        };
+        let got = run_and_prune_mesh(&mars);
+        for dim in 0..3 {
+            let g: std::collections::BTreeSet<_> = got[dim].iter().cloned().collect();
+            let e: std::collections::BTreeSet<_> = expected[dim].iter().cloned().collect();
+            let only_mesh: Vec<_> = g.difference(&e).take(5).collect();
+            let only_regular: Vec<_> = e.difference(&g).take(5).collect();
+            assert!(
+                g == e,
+                "dimension {}: regular grid has {} swap-bearing edges, mesh grid {}; \
+                 {} only in mesh (e.g. {:?}), {} only in regular (e.g. {:?})",
+                dim,
+                e.len(),
+                g.len(),
+                g.difference(&e).count(),
+                only_mesh,
+                e.difference(&g).count(),
+                only_regular
+            );
+            assert!(!got[dim].is_empty() || dim == 2);
+        }
+    }
+
+    #[test]
+    fn snapshot_medial_axes_for_bcc_mesh_grid() {
+        let complex = test_complex_cube();
+        let block = lattice_block(Lattice::Bcc, [4, 4, 4], 0.4, Pos([0.3; 3]));
+        let obj = block_to_obj(&block, &ObjOptions::default());
+        let grid = grid::VineyardsGridMesh::read_from_obj_string(&obj).unwrap();
+        assert_eq!(grid.points.len(), 125 + 64);
+        let mars = Mars {
+            complex: Some(complex),
+            grid: Some(Grid::Mesh(grid)),
+        };
+        let got = run_and_prune_mesh(&mars);
+        for dim in 0..3 {
+            insta::assert_json_snapshot!(got[dim]);
+        }
+    }
 }
