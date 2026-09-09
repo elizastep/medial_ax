@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use rstar::{RTree, RTreeObject, AABB};
 use tracing::{instrument, trace};
 
 use crate::{
@@ -347,6 +348,210 @@ impl Bbox {
     }
 }
 
+/// A single triangle of a [DualMesh] face, in the form used by the intersection test.
+#[derive(Clone, Debug)]
+struct Tri {
+    /// The [DualMesh] face this triangle was cut from.
+    face: u32,
+    /// First corner.
+    a: Pos,
+    /// Edge from `a` to the second corner.
+    ab: Pos,
+    /// Edge from `a` to the third corner.
+    ac: Pos,
+}
+
+impl RTreeObject for Tri {
+    type Envelope = AABB<[f64; 3]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        let b = self.a + self.ab;
+        let c = self.a + self.ac;
+        let mut lo = [0.0; 3];
+        let mut hi = [0.0; 3];
+        for j in 0..3 {
+            lo[j] = self.a.0[j].min(b.0[j]).min(c.0[j]);
+            hi[j] = self.a.0[j].max(b.0[j]).max(c.0[j]);
+        }
+        AABB::from_corners(lo, hi)
+    }
+}
+
+/// Barycentric slack in the segment/triangle test.  We assume a grid edge never passes very close
+/// to the boundary of a dual face, so this only needs to be big enough that an edge crossing the
+/// seam between two triangles of the same fan is caught by at least one of them.
+const TRI_EPS: f64 = 1e-9;
+
+impl Tri {
+    /// Fan-triangulate every face of a dual mesh.  Valid because we require the faces to be
+    /// convex.
+    fn tree_for(points: &[Pos], faces: &[Vec<u32>]) -> RTree<Tri> {
+        let mut tris = Vec::new();
+        for (fi, face) in faces.iter().enumerate() {
+            for k in 1..face.len().saturating_sub(1) {
+                let a = points[face[0] as usize];
+                let b = points[face[k] as usize];
+                let c = points[face[k + 1] as usize];
+                tris.push(Tri {
+                    face: fi as u32,
+                    a,
+                    ab: b - a,
+                    ac: c - a,
+                });
+            }
+        }
+        RTree::bulk_load(tris)
+    }
+
+    /// Möller-Trumbore, restricted to the segment `p + t * d` for `t` in
+    /// `(0, 1)`, and two-sided, since the winding of the dual faces is
+    /// arbitrary.
+    fn is_crossed_by(&self, p: Pos, d: Pos) -> bool {
+        let pvec = d.cross(&self.ac);
+        let det = self.ab.dot(&pvec);
+        let parallel = det.abs() < 1e-30;
+        if parallel {
+            return false;
+        }
+        let inv = 1.0 / det;
+
+        let tvec = p - self.a;
+        let u = tvec.dot(&pvec) * inv;
+        if u < -TRI_EPS || 1.0 + TRI_EPS < u {
+            return false;
+        }
+
+        let qvec = tvec.cross(&self.ab);
+        let v = d.dot(&qvec) * inv;
+        if v < -TRI_EPS || 1.0 + TRI_EPS < u + v {
+            return false;
+        }
+
+        let t = self.ac.dot(&qvec) * inv;
+        0.0 < t && t < 1.0
+    }
+}
+
+/// The dual mesh of the input grid is used for more complex faces than regular
+/// quads. We require faces of the dual to be convex.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DualMesh {
+    pub points: Vec<Pos>,
+    pub faces: Vec<Vec<u32>>,
+    #[serde(skip)]
+    tree: Option<RTree<Tri>>,
+}
+
+impl DualMesh {
+    /// Read a dual mesh from the contents of an .obj file.
+    pub fn read_from_obj_string(s: &str) -> Result<Self, String> {
+        let mut points: Vec<Pos> = Vec::new();
+        let mut faces: Vec<Vec<u32>> = Vec::new();
+
+        for (line_no, line) in s.lines().enumerate() {
+            let mut tokens = line.trim().split_ascii_whitespace();
+            let Some(kind) = tokens.next() else {
+                continue;
+            };
+
+            let err = |what: &str| format!("dual mesh, line {}: {}", line_no + 1, what);
+
+            match kind {
+                "v" => {
+                    let mut c = [0.0; 3];
+                    for j in 0..3 {
+                        c[j] = tokens
+                            .next()
+                            .ok_or_else(|| err("vertex needs three coordinates"))?
+                            .parse::<f64>()
+                            .map_err(|e| err(&e.to_string()))?;
+                    }
+                    points.push(Pos(c));
+                }
+                "f" => {
+                    let mut face = Vec::new();
+                    for tok in tokens {
+                        // `f 1`, `f 1/2`, `f 1/2/3` and `f 1//3` all mean vertex 1 here.
+                        let vs = tok.split('/').next().unwrap_or(tok);
+                        let i = vs.parse::<isize>().map_err(|e| err(&e.to_string()))?;
+                        // .obj indices are 1-based, and negative ones count back from the end.
+                        let i = if i < 0 {
+                            points.len() as isize + i
+                        } else {
+                            i - 1
+                        };
+                        if i < 0 || points.len() as isize <= i {
+                            return Err(err(&format!("face index {} out of range", i + 1)));
+                        }
+                        face.push(i as u32);
+                    }
+                    if face.len() < 3 {
+                        return Err(err("face needs at least three vertices"));
+                    }
+                    faces.push(face);
+                }
+                _ => continue,
+            }
+        }
+
+        if faces.is_empty() {
+            return Err("dual mesh has no faces".to_string());
+        }
+
+        Ok(Self {
+            points,
+            faces,
+            tree: None,
+        })
+    }
+
+    pub fn num_faces(&self) -> usize {
+        self.faces.len()
+    }
+
+    fn tree(&mut self) -> &RTree<Tri> {
+        self.tree
+            .get_or_insert_with(|| Tri::tree_for(&self.points, &self.faces))
+    }
+
+    /// The corners of the dual face crossed by the segment from `p` to `q`, wound so that the
+    /// polygon normal points from `p` towards `q`.
+    pub fn face_points_crossed_by(&mut self, p: Pos, q: Pos) -> Option<Vec<Pos>> {
+        let d = q - p;
+        let envelope = AABB::from_corners(
+            [p.x().min(q.x()), p.y().min(q.y()), p.z().min(q.z())],
+            [p.x().max(q.x()), p.y().max(q.y()), p.z().max(q.z())],
+        );
+        // We assume a grid edge crosses at most one dual face, so the first hit wins.
+        let fi = self
+            .tree()
+            .locate_in_envelope_intersecting(envelope)
+            .find(|t| t.is_crossed_by(p, d))?
+            .face as usize;
+        let mut pts: Vec<Pos> = self.faces[fi]
+            .iter()
+            .map(|i| self.points[*i as usize])
+            .collect();
+
+        // Newell's method for the normal of a polygon.
+        let mut n = Pos([0.0; 3]);
+        for k in 0..pts.len() {
+            let a = pts[k];
+            let b = pts[(k + 1) % pts.len()];
+            n = n + Pos([
+                (a.y() - b.y()) * (a.z() + b.z()),
+                (a.z() - b.z()) * (a.x() + b.x()),
+                (a.x() - b.x()) * (a.y() + b.y()),
+            ]);
+        }
+        if n.dot(&(q - p)) < 0.0 {
+            pts.reverse();
+        }
+
+        Some(pts)
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VineyardsGridMesh {
     pub points: Vec<Pos>,
@@ -358,6 +563,9 @@ pub struct VineyardsGridMesh {
     /// Grid distances along the three axes, assuming the mesh is a subset of a regular grid.
     #[serde(skip)]
     pub dim_dist: Option<(f64, f64, f64)>,
+
+    #[serde(default)]
+    pub dual: Option<DualMesh>,
 }
 
 impl VineyardsGridMesh {
@@ -367,6 +575,7 @@ impl VineyardsGridMesh {
             neighbors: Vec::new(),
             r#type: "meshgrid".to_string(),
             dim_dist: None,
+            dual: None,
         }
     }
 
@@ -416,6 +625,22 @@ impl VineyardsGridMesh {
             panic!("bad points {:?} {:?}", a, b);
         };
         ret
+    }
+
+    /// The corners of the dual face between the two adjacent grid points `a` and `b`.
+    ///
+    /// If the grid has a real dual mesh attached, this is the polygon of that mesh crossed by the
+    /// grid edge.  Otherwise we fall back to [Self::dual_quad_points].
+    ///
+    /// [None] means we had a dual mesh but no face of it was crossed by this edge, which happens
+    /// for edges on the boundary of the region the dual mesh covers.
+    pub fn dual_face_points(&mut self, a: Index, b: Index) -> Option<Vec<Pos>> {
+        let p = self.coordinate(a);
+        let q = self.coordinate(b);
+        match self.dual {
+            Some(ref mut dual) => dual.face_points_crossed_by(p, q),
+            None => Some(self.dual_quad_points(a, b).to_vec()),
+        }
     }
 
     /// Lower- and upper corner of the bounding box.
@@ -486,12 +711,14 @@ impl VineyardsGridMesh {
                 neighbors: lower_edges,
                 r#type: self.r#type.clone(),
                 dim_dist: None,
+                dual: None,
             },
             VineyardsGridMesh {
                 points: self.points.clone(),
                 neighbors: upper_edges,
                 r#type: self.r#type.clone(),
                 dim_dist: None,
+                dual: None,
             },
         )
     }
@@ -750,6 +977,7 @@ impl VineyardsGridMesh {
             neighbors,
             r#type: "meshgrid".to_string(),
             dim_dist,
+            dual: None,
         })
     }
 
@@ -820,5 +1048,380 @@ impl VineyardsGridMesh {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dual_tests {
+    use super::*;
+
+    const A: f64 = 1.0;
+
+    fn norm(p: Pos) -> Pos {
+        let l = (p.dot(&p)).sqrt();
+        p / l
+    }
+
+    fn centroid(pts: &[Pos]) -> Pos {
+        let mut c = Pos([0.0; 3]);
+        for p in pts {
+            c = c + *p;
+        }
+        c / pts.len() as f64
+    }
+
+    /// The 24 corners of the Voronoi cell of a BCC lattice with lattice constant `a`: a truncated
+    /// octahedron, whose corners are the permutations of `(0, ±a/4, ±a/2)`.
+    fn truncated_octahedron(a: f64) -> Vec<Pos> {
+        let mut v = Vec::new();
+        for (i, j, k) in [
+            (0, 1, 2),
+            (0, 2, 1),
+            (1, 0, 2),
+            (1, 2, 0),
+            (2, 0, 1),
+            (2, 1, 0),
+        ] {
+            for s1 in [-1.0, 1.0] {
+                for s2 in [-1.0, 1.0] {
+                    let mut p = [0.0; 3];
+                    p[i] = 0.0;
+                    p[j] = s1 * a / 4.0;
+                    p[k] = s2 * a / 2.0;
+                    let p = Pos(p);
+                    if !v.iter().any(|q: &Pos| q.dist(&p) < 1e-12) {
+                        v.push(p);
+                    }
+                }
+            }
+        }
+        assert_eq!(v.len(), 24);
+        v
+    }
+
+    /// The 14 neighbours of a BCC site: 8 along the body diagonals (which share the hexagonal
+    /// faces of the cell) and 6 along the axes (the square faces).
+    fn bcc_offsets(a: f64) -> Vec<Pos> {
+        let mut o = Vec::new();
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                for sz in [-1.0, 1.0] {
+                    o.push(Pos([sx * a / 2.0, sy * a / 2.0, sz * a / 2.0]));
+                }
+            }
+        }
+        for j in 0..3 {
+            for s in [-1.0, 1.0] {
+                let mut p = [0.0; 3];
+                p[j] = s * a;
+                o.push(Pos(p));
+            }
+        }
+        assert_eq!(o.len(), 14);
+        o
+    }
+
+    /// Put the corners of a planar convex polygon into boundary order.
+    fn sort_around(pts: &mut Vec<Pos>, n: Pos) {
+        let c = centroid(pts);
+        let n = norm(n);
+        // Any direction in the plane will do as the zero angle.
+        let seed = if n.x().abs() < 0.9 {
+            Pos([1.0, 0.0, 0.0])
+        } else {
+            Pos([0.0, 1.0, 0.0])
+        };
+        let u = norm(seed - n * seed.dot(&n));
+        let v = n.cross(&u);
+        pts.sort_by(|p, q| {
+            let ap = (p.dot(&v) - c.dot(&v)).atan2(p.dot(&u) - c.dot(&u));
+            let aq = (q.dot(&v) - c.dot(&v)).atan2(q.dot(&u) - c.dot(&u));
+            ap.partial_cmp(&aq).unwrap()
+        });
+    }
+
+    /// A BCC lattice over `[0, n]^3` together with its Voronoi mesh, built from the geometry of
+    /// the truncated octahedron so that the correspondence is known by construction.
+    ///
+    /// The dual is emitted un-welded, one closed polyhedron per site, so interior faces appear
+    /// twice at the same place -- the harder of the two layouts a user might hand us.
+    fn bcc_lattice(n: isize, triangulate: bool) -> VineyardsGridMesh {
+        let mut sites: Vec<Pos> = Vec::new();
+        for i in 0..=n {
+            for j in 0..=n {
+                for k in 0..=n {
+                    sites.push(Pos([i as f64 * A, j as f64 * A, k as f64 * A]));
+                    if i < n && j < n && k < n {
+                        sites.push(Pos([
+                            (i as f64 + 0.5) * A,
+                            (j as f64 + 0.5) * A,
+                            (k as f64 + 0.5) * A,
+                        ]));
+                    }
+                }
+            }
+        }
+
+        // Bonds: every pair of sites separated by one of the 14 neighbour offsets.
+        let offsets = bcc_offsets(A);
+        let mut neighbors: Vec<Vec<isize>> = vec![Vec::new(); sites.len()];
+        for (i, s) in sites.iter().enumerate() {
+            for d in &offsets {
+                let t = *s + *d;
+                if let Some(j) = sites.iter().position(|q| q.dist(&t) < 1e-9) {
+                    neighbors[i].push(j as isize);
+                }
+            }
+        }
+
+        // Dual: the truncated octahedron around every site.  The face for offset `d` is made of
+        // the cell corners lying on the bisector plane between the site and its neighbour.
+        let cell = truncated_octahedron(A);
+        let mut points: Vec<Pos> = Vec::new();
+        let mut faces: Vec<Vec<u32>> = Vec::new();
+        for s in &sites {
+            for d in &offsets {
+                let dh = norm(*d);
+                let half = (d.dot(d)).sqrt() / 2.0;
+                let mut face: Vec<Pos> = cell
+                    .iter()
+                    .filter(|v| (v.dot(&dh) - half).abs() < 1e-9)
+                    .map(|v| *v + *s)
+                    .collect();
+                assert!(
+                    face.len() == 4 || face.len() == 6,
+                    "a truncated octahedron has square and hexagonal faces, got {}",
+                    face.len()
+                );
+                sort_around(&mut face, dh);
+
+                let base = points.len() as u32;
+                points.extend_from_slice(&face);
+                let idx: Vec<u32> = (0..face.len() as u32).map(|k| base + k).collect();
+                if triangulate {
+                    for k in 1..idx.len() - 1 {
+                        faces.push(vec![idx[0], idx[k], idx[k + 1]]);
+                    }
+                } else {
+                    faces.push(idx);
+                }
+            }
+        }
+
+        VineyardsGridMesh {
+            points: sites,
+            neighbors,
+            r#type: "meshgrid".to_string(),
+            dim_dist: None,
+            dual: Some(DualMesh {
+                points,
+                faces,
+                tree: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn bcc_edges_find_their_own_voronoi_face() {
+        let mut grid = bcc_lattice(2, false);
+        let sites = grid.points.clone();
+        let neighbors = grid.neighbors.clone();
+
+        let mut hexagons = 0;
+        let mut squares = 0;
+
+        for (i, ns) in neighbors.iter().enumerate() {
+            for &j in ns {
+                let (a, b) = (Index::fake(i as isize), Index::fake(j));
+                let (p, q) = (sites[i], sites[j as usize]);
+                let pts = grid
+                    .dual_face_points(a, b)
+                    .unwrap_or_else(|| panic!("no dual face for bond {:?} -> {:?}", p, q));
+
+                let d = q - p;
+                let dh = norm(d);
+                let half = (d.dot(&d)).sqrt() / 2.0;
+
+                // Every corner lies on the perpendicular bisector plane of the bond.
+                for c in &pts {
+                    let signed = (*c - p).dot(&dh);
+                    assert!(
+                        (signed - half).abs() < 1e-9,
+                        "corner {:?} is not on the bisector of {:?} -> {:?}",
+                        c,
+                        p,
+                        q
+                    );
+                }
+
+                // The face is centred on the bond, and is the right shape: a hexagon for the 8
+                // body-diagonal bonds, a square for the 6 axis-aligned ones.
+                let mid = p + d / 2.0;
+                assert!(centroid(&pts).dist(&mid) < 1e-9);
+                let diagonal = d.x().abs() > 1e-9 && d.y().abs() > 1e-9 && d.z().abs() > 1e-9;
+                if diagonal {
+                    assert_eq!(pts.len(), 6, "body-diagonal bonds share hexagons");
+                    hexagons += 1;
+                } else {
+                    assert_eq!(pts.len(), 4, "axis-aligned bonds share squares");
+                    squares += 1;
+                }
+
+                // Wound so that the normal points from `p` towards `q`.
+                let n = (pts[1] - pts[0]).cross(&(pts[2] - pts[0]));
+                assert!(n.dot(&d) > 0.0, "face is wound the wrong way round");
+            }
+        }
+
+        assert!(0 < hexagons && 0 < squares, "expected both kinds of face");
+    }
+
+    #[test]
+    fn bcc_edges_match_a_triangulated_dual() {
+        let mut grid = bcc_lattice(2, true);
+        let sites = grid.points.clone();
+        let neighbors = grid.neighbors.clone();
+
+        for (i, ns) in neighbors.iter().enumerate() {
+            for &j in ns {
+                let (p, q) = (sites[i], sites[j as usize]);
+                let pts = grid
+                    .dual_face_points(Index::fake(i as isize), Index::fake(j))
+                    .expect("triangulated dual should still be hit");
+
+                // A fan triangle of the face, rather than the whole face, but still on the
+                // bisector plane of the bond.
+                assert_eq!(pts.len(), 3);
+                let dh = norm(q - p);
+                let half = p.dist(&q) / 2.0;
+                for c in &pts {
+                    assert!(((*c - p).dot(&dh) - half).abs() < 1e-9);
+                }
+            }
+        }
+    }
+
+    /// On a cubic grid the inferred quad *is* the dual face, so the two paths have to agree.
+    #[test]
+    fn cubic_dual_agrees_with_the_inferred_quad() {
+        let n = 3;
+        let mut sites = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    sites.push(Pos([i as f64, j as f64, k as f64]));
+                }
+            }
+        }
+        let mut neighbors: Vec<Vec<isize>> = vec![Vec::new(); sites.len()];
+        for (i, s) in sites.iter().enumerate() {
+            for (j, t) in sites.iter().enumerate() {
+                if (s.dist(t) - 1.0).abs() < 1e-9 {
+                    neighbors[i].push(j as isize);
+                }
+            }
+        }
+
+        // The dual of a cubic grid: the six faces of the unit cube around every site.
+        let mut points = Vec::new();
+        let mut faces = Vec::new();
+        for s in &sites {
+            for j in 0..3 {
+                for sign in [-1.0, 1.0] {
+                    let (u, v) = ((j + 1) % 3, (j + 2) % 3);
+                    let mut face = Vec::new();
+                    for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                        let mut c = [0.0; 3];
+                        c[j] = sign * 0.5;
+                        c[u] = su * 0.5;
+                        c[v] = sv * 0.5;
+                        face.push(*s + Pos(c));
+                    }
+                    let base = points.len() as u32;
+                    points.extend_from_slice(&face);
+                    faces.push((0..4).map(|k| base + k).collect());
+                }
+            }
+        }
+
+        let plain = VineyardsGridMesh {
+            points: sites.clone(),
+            neighbors: neighbors.clone(),
+            r#type: "meshgrid".to_string(),
+            dim_dist: Some((1.0, 1.0, 1.0)),
+            dual: None,
+        };
+        let mut with_dual = VineyardsGridMesh {
+            dual: Some(DualMesh {
+                points,
+                faces,
+                tree: None,
+            }),
+            ..plain.clone()
+        };
+
+        let sort_key = |pts: &[Pos]| {
+            let mut v: Vec<String> = pts.iter().map(|p| format!("{:?}", p)).collect();
+            v.sort();
+            v
+        };
+
+        for (i, ns) in neighbors.iter().enumerate() {
+            for &j in ns {
+                let (a, b) = (Index::fake(i as isize), Index::fake(j));
+                let quad = plain.dual_quad_points(a, b);
+                let face = with_dual.dual_face_points(a, b).expect("cube face");
+                assert_eq!(
+                    sort_key(&quad),
+                    sort_key(&face),
+                    "inferred quad and cube dual face differ for {:?} -> {:?}",
+                    sites[i],
+                    sites[j as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dual_obj_parser_handles_blender_output() {
+        // Normals and texture coordinates must not be mistaken for vertices, faces may name them,
+        // and negative indices count back from the end.
+        let obj = "\
+# a comment
+mtllib whatever.mtl
+o Cell
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0.5 0.5
+vn 0.0 0.0 1.0
+usemtl Material
+s off
+f 1/1/1 2/1/1 3/1/1 4/1/1
+f -4 -3 -2
+";
+        let dual = DualMesh::read_from_obj_string(obj).expect("should parse");
+        assert_eq!(dual.points.len(), 4, "vn/vt must not become points");
+        assert_eq!(dual.faces.len(), 2);
+        assert_eq!(dual.faces[0], vec![0, 1, 2, 3]);
+        assert_eq!(
+            dual.faces[1],
+            vec![0, 1, 2],
+            "negative indices are relative"
+        );
+
+        assert!(
+            DualMesh::read_from_obj_string("v 0 0 0\n").is_err(),
+            "no faces"
+        );
+        assert!(
+            DualMesh::read_from_obj_string("v 0 0 0\nf 1 2\n").is_err(),
+            "2-gon"
+        );
+        assert!(
+            DualMesh::read_from_obj_string("v 0 0 0\nf 1 2 9\n").is_err(),
+            "out of range"
+        );
     }
 }

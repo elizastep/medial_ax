@@ -2,15 +2,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use mars_core::{
     complex::Complex,
-    grid::{Index, VineyardsGridMesh},
+    grid::{DualMesh, Index, VineyardsGridMesh},
     stats::{MarsMem, ReductionMem},
     Grid, Mars, PruningParam, Swap,
 };
 use std::{
     io::{BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use clap::{Args, Parser, Subcommand};
@@ -63,6 +63,16 @@ struct RunArgs {
         value_name = "mesh.obj"
     )]
     mesh_path: PathBuf,
+
+    #[arg(
+        short,
+        long,
+        help = "Path to the .obj file for the dual mesh of the grid.  The output axes will use faces\
+                from this grid.  We assume each edge in the mesh-path only intersects it's\
+                corresponding face in the dual mesh.",
+        value_name = "dual.obj"
+    )]
+    dual_path: Option<PathBuf>,
 
     #[arg(short, long, help = "Number of threads to run in parallel.")]
     threads: Option<usize>,
@@ -221,22 +231,24 @@ impl ObjArgs {
             info!("Write medial axes to {}", p.display());
 
             let mut vi = 0;
+            let mut missing = 0;
             for dim in 0..3 {
                 let swaps = &swaps[dim];
 
                 writeln!(&mut f, "o ma-dim-{}", dim)?;
 
                 for (gi, gj, swaps) in swaps {
-                    if 0 < swaps.len() {
-                        let pts = grid.dual_quad_points(*gi, *gj);
-                        for p in &pts {
-                            writeln!(&mut f, "v {} {} {}", p.x(), p.y(), p.z())?;
-                        }
-                        writeln!(&mut f, "f {} {} {} {}", vi + 1, vi + 2, vi + 3, vi + 4)?;
-                        vi += 4;
+                    if !swaps.is_empty() {
+                        let Some(pts) = grid.dual_face_points(*gi, *gj) else {
+                            missing += 1;
+                            continue;
+                        };
+                        write_dual_face(&mut f, &pts, vi)?;
+                        vi += pts.len();
                     }
                 }
             }
+            warn_missing_dual_faces(missing);
         }
 
         // if let Some(ref p) = self.complex {
@@ -362,6 +374,7 @@ impl ObjArgs {
 
             info!("Write medial axes to {}", p.display());
             let mut vi = 0;
+            let mut missing = 0;
             for dim in 0..3 {
                 let swaps = &vin.swaps[dim];
 
@@ -374,35 +387,138 @@ impl ObjArgs {
                 {
                     Grid::Regular(grid) => {
                         for s in swaps {
-                            if 0 < s.2.v.len() {
+                            if !s.2.v.is_empty() {
                                 let pts = grid.dual_quad_points(s.0, s.1);
-                                for p in &pts {
-                                    writeln!(&mut f, "v {} {} {}", p.x(), p.y(), p.z())?;
-                                }
-                                writeln!(&mut f, "f {} {} {} {}", vi + 1, vi + 2, vi + 3, vi + 4)?;
-                                vi += 4;
+                                write_dual_face(&mut f, &pts, vi)?;
+                                vi += pts.len();
                             }
                         }
                     }
                     Grid::Mesh(grid) => {
                         grid.recompute_dim_dist();
                         for s in swaps {
-                            if 0 < s.2.v.len() {
-                                let pts = grid.dual_quad_points(s.0, s.1);
-                                for p in &pts {
-                                    writeln!(&mut f, "v {} {} {}", p.x(), p.y(), p.z())?;
-                                }
-                                writeln!(&mut f, "f {} {} {} {}", vi + 1, vi + 2, vi + 3, vi + 4)?;
-                                vi += 4;
+                            if !s.2.v.is_empty() {
+                                let Some(pts) = grid.dual_face_points(s.0, s.1) else {
+                                    missing += 1;
+                                    continue;
+                                };
+                                write_dual_face(&mut f, &pts, vi)?;
+                                vi += pts.len();
                             }
                         }
                     }
                 }
             }
+            warn_missing_dual_faces(missing);
         }
 
         Ok(())
     }
+}
+
+/// Write one medial axis face as an .obj polygon. `vi` is the number of
+/// vertices written to the file so far, since .obj face indices are into the
+/// whole file.
+fn write_dual_face<W: Write>(mut w: W, pts: &[mars_core::complex::Pos], vi: usize) -> Result<()> {
+    for p in pts {
+        writeln!(w, "v {} {} {}", p.x(), p.y(), p.z())?;
+    }
+    write!(w, "f")?;
+    for k in 0..pts.len() {
+        write!(w, " {}", vi + 1 + k)?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Grid edges that carry a swap but don't cross any face of the dual mesh
+/// contribute nothing to the medial axis, so say so rather than silently
+/// dropping them.
+fn warn_missing_dual_faces(missing: usize) {
+    if 0 < missing {
+        error!(
+            "{} grid edges with swaps did not cross any face of the dual mesh, and were left out \
+             of the medial axes",
+            missing
+        );
+    }
+}
+
+/// Read the grid mesh, and attach its dual mesh if one was given.
+fn load_mesh_grid(mesh_path: &Path, dual_path: Option<&Path>) -> Result<VineyardsGridMesh> {
+    let obj_string = std::fs::read_to_string(mesh_path)
+        .with_context(|| format!("failed to read mesh path: {:?}", mesh_path))?;
+    let mut mesh_grid = VineyardsGridMesh::read_from_obj_string(&obj_string)
+        .map_err(|e| anyhow!(e))
+        .context("failed to read grid mesh")?;
+
+    let Some(dual_path) = dual_path else {
+        return Ok(mesh_grid);
+    };
+
+    let dual_string = std::fs::read_to_string(dual_path)
+        .with_context(|| format!("failed to read dual path: {:?}", dual_path))?;
+    let dual = DualMesh::read_from_obj_string(&dual_string)
+        .map_err(|e| anyhow!(e))
+        .context("failed to read dual mesh")?;
+    info!(
+        "read dual mesh: #v={} #f={}",
+        dual.points.len(),
+        dual.num_faces()
+    );
+    mesh_grid.dual = Some(dual);
+
+    // Which dual face belongs to which grid edge is worked out lazily, in
+    // `mars-cli obj`. So check up front that the two files line up: otherwise a
+    // mismatched pair only shows up as an empty medial axis, after the entire
+    // run has finished.
+    let (checked, hit) = sample_dual_hits(&mut mesh_grid, 64);
+    if checked == 0 {
+        bail!("the grid mesh has no edges");
+    }
+    if hit == 0 {
+        bail!(
+            "none of the {} sampled grid edges cross a face of the dual mesh. Are the two .obj \
+             files in the same coordinate system?",
+            checked
+        );
+    }
+    info!(
+        "dual mesh check: {}/{} sampled grid edges cross a dual face",
+        hit, checked
+    );
+
+    Ok(mesh_grid)
+}
+
+/// Sample up to `n` grid edges of [grid] and count how many of them cross a
+/// face of the dual mesh.
+fn sample_dual_hits(grid: &mut VineyardsGridMesh, n: usize) -> (usize, usize) {
+    let edges: Vec<(Index, Index)> = grid
+        .neighbors
+        .iter()
+        .enumerate()
+        .flat_map(|(v, ns)| {
+            ns.iter()
+                .filter(move |w| (v as isize) < **w)
+                .map(move |w| (Index::fake(v as isize), Index::fake(*w)))
+        })
+        .collect();
+
+    if edges.is_empty() {
+        return (0, 0);
+    }
+
+    let step = (edges.len() / n).max(1);
+    let mut checked = 0;
+    let mut hit = 0;
+    for (a, b) in edges.iter().step_by(step).take(n) {
+        checked += 1;
+        if grid.dual_face_points(*a, *b).is_some() {
+            hit += 1;
+        }
+    }
+    (checked, hit)
 }
 
 fn default_pruning_params() -> [PruningParam; 3] {
@@ -594,15 +710,7 @@ impl RunArgs {
             .context("failed to read complex")
             .unwrap();
 
-        let mesh_grid = {
-            let obj_string = std::fs::read_to_string(&self.mesh_path)
-                .with_context(|| format!("failed to read mesh path: {:?}", self.mesh_path))
-                .unwrap();
-            VineyardsGridMesh::read_from_obj_string(&obj_string)
-        }
-        .map_err(|e| anyhow!(e))
-        .context("failed to read complex")
-        .unwrap();
+        let mesh_grid = load_mesh_grid(&self.mesh_path, self.dual_path.as_deref())?;
 
         let mars = mars_core::Mars {
             complex: Some(complex),
@@ -671,15 +779,7 @@ fn run(args: &RunArgs) -> Result<()> {
         .context("failed to read complex")
         .unwrap();
 
-    let mesh_grid = {
-        let obj_string = std::fs::read_to_string(&args.mesh_path)
-            .with_context(|| format!("failed to read mesh path: {:?}", args.mesh_path))
-            .unwrap();
-        VineyardsGridMesh::read_from_obj_string(&obj_string)
-    }
-    .map_err(|e| anyhow!(e))
-    .context("failed to read complex")
-    .unwrap();
+    let mesh_grid = load_mesh_grid(&args.mesh_path, args.dual_path.as_deref())?;
 
     let mars = mars_core::Mars {
         complex: Some(complex),

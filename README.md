@@ -148,6 +148,21 @@ The user inputs an .obj file containing a three-dimensional simplicial complex.
 ### Grid
 You can import a grid you have made yourself, for example in Blender, and exported as an .obj. Our favorite way to make a grid in Blender is to start with a cube, use three array modifiers to fit it to your object in 3 dimensions, apply the modifiers, deduplicate vertices, and delete all faces (leaving edges and vertices). If you wish, you can import ```blender_scripts/select_and_delete.py``` as a blender script to delete the grid vertices outside of your object to not waste computation time. Warning: we haven't tested the select_and_delete script very much, and blender can be finnicky. It works most of the time ⚠️, and it requires that the input object be closed, as it uses raycasting. In particular, it won't work on the squished cylinder example. A good heuristic for grid density is to have at least two grid cubes per input complex face.
 
+### Dual mesh (optional, `mars-cli` only)
+Without a dual mesh, the medial axis face for a grid edge is an axis-aligned quad, sized from the
+grid spacing that we infer from the .obj.  That is only the right shape when the grid is a cubic
+one, but not in general.
+
+For other grids, pass the dual of the grid as a second .obj with `-d`:
+
+```sh
+mars-cli run complex.obj -m lattice.obj -d dual.obj -s -o output
+```
+
+The medial axes written by `mars-cli obj` are then made of the faces from `dual.obj`.  We assume
+that each edge in `lattice.obj` intersects at most one face in `dual.obj` and that those edges and
+faces correspond to each other.  This is only true for certain dual meshes.
+
 # What's happening on the inside
 
 ## Creating dual grids
