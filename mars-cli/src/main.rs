@@ -2,15 +2,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use mars_core::{
     complex::{Complex, Pos},
-    grid::{GridReport, Index, VineyardsGridMesh},
+    grid::{write_face, GridReport, Index, VineyardsGridMesh},
     stats::{MarsMem, ReductionMem},
     Grid, Mars, PruningParam, Swap,
 };
 use std::{
-    io::{BufReader, Write},
-    path::PathBuf,
+    io::{BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
 };
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use clap::{Args, Parser, Subcommand};
@@ -219,11 +219,8 @@ struct ObjArgs {
 /// (0.0 if ).
 type SlimFile = ([Vec<(Index, Index, Vec<(Swap, f64, f64)>)>; 3], Mars);
 
-/// Read the grid mesh, and its dual from the same file or from `dual_path`, and log the report.
-fn load_grid(
-    mesh_path: &PathBuf,
-    dual_path: Option<&PathBuf>,
-) -> Result<(VineyardsGridMesh, GridReport)> {
+/// Read the grid mesh, and its dual from the same file or from `dual_path`, and check the report.
+fn load_grid(mesh_path: &Path, dual_path: Option<&Path>) -> Result<(VineyardsGridMesh, GridReport)> {
     let obj_string = std::fs::read_to_string(mesh_path)
         .with_context(|| format!("failed to read grid path: {:?}", mesh_path))?;
     let (mut grid, mut report) = VineyardsGridMesh::read_from_obj_string_with_report(&obj_string)
@@ -240,7 +237,7 @@ fn load_grid(
     }
 
     for line in report.to_string().lines() {
-        info!("{}", line);
+        debug!("{}", line);
     }
     if report.has_dual() && report.faces_matched == 0 {
         bail!(
@@ -248,31 +245,56 @@ fn load_grid(
             report.faces_total
         );
     }
-    if report.edges_without_face > 0 {
-        warn!(
-            "{} grid edges have no dual face; swaps found along them will not appear in the output",
-            report.edges_without_face
+    if report.has_dual() && report.faces_matched < report.faces_total / 2 {
+        error!(
+            "only {} of {} dual faces could be linked to a grid edge. Culled grids legitimately \
+             have many outer walls, but this also happens when the dual was exported with other \
+             axes than the grid, belongs to another lattice, or when objects were hidden during \
+             export. Check with `mars-cli grid-check` before spending time on a run.",
+            report.faces_matched, report.faces_total
         );
+    }
+    if report.edges_without_face > 0 {
+        let msg = format!(
+            "{} of {} grid edges have no dual face; swaps found along them will not appear in the output",
+            report.edges_without_face, report.edges
+        );
+        if report.edges_without_face > report.edges / 2 {
+            error!("{}. Is the dual the Voronoi tessellation of this lattice?", msg);
+        } else {
+            warn!("{}", msg);
+        }
     }
     Ok((grid, report))
 }
 
-/// Write one output face: its vertices as `v` lines and one `f` line.  Returns `false` (writing
-/// nothing) for faces with fewer than three vertices.
-fn write_face<W: Write>(f: &mut W, pts: &[Pos], vi: &mut usize) -> std::io::Result<bool> {
-    if pts.len() < 3 {
-        return Ok(false);
+/// Write the medial axes as one `.obj` with objects `ma-dim-0`, `ma-dim-1`, `ma-dim-2`.
+/// `edges[d]` lists the swap-bearing grid edges of dimension `d`; `face_of` is the dual polygon
+/// of an edge (empty if it has none, in which case the edge is skipped and counted).
+fn write_axes_obj(
+    path: &Path,
+    edges: [Vec<(Index, Index)>; 3],
+    face_of: impl Fn(Index, Index) -> Vec<Pos>,
+) -> Result<()> {
+    info!("Write medial axes to {}", path.display());
+    let mut f = BufWriter::new(std::fs::File::create(path).context("create passed file")?);
+    let (mut vi, mut skipped) = (0, 0);
+    for (dim, edges) in edges.iter().enumerate() {
+        writeln!(f, "o ma-dim-{}", dim)?;
+        for &(a, b) in edges {
+            if !write_face(&mut f, &face_of(a, b), &mut vi)? {
+                skipped += 1;
+            }
+        }
     }
-    for p in pts {
-        writeln!(f, "v {} {} {}", p.x(), p.y(), p.z())?;
+    f.flush()?;
+    if skipped > 0 {
+        warn!(
+            "{} swap-bearing grid edges had no dual face and were not written",
+            skipped
+        );
     }
-    let ids = (1..=pts.len())
-        .map(|k| (*vi + k).to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    writeln!(f, "f {}", ids)?;
-    *vi += pts.len();
-    Ok(true)
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -294,7 +316,7 @@ struct GridCheckArgs {
 
 impl GridCheckArgs {
     fn run(&self) -> Result<()> {
-        let (_, report) = load_grid(&self.mesh_path, self.dual_path.as_ref())?;
+        let (_, report) = load_grid(&self.mesh_path, self.dual_path.as_deref())?;
         println!("{}", report);
         Ok(())
     }
@@ -306,37 +328,18 @@ impl ObjArgs {
         let slim_file: SlimFile = rmp_serde::from_slice(&bytes).context("rmp read")?;
 
         let swaps = slim_file.0;
-        let Some(Grid::Mesh(mut grid)) = slim_file.1.grid else {
+        let Some(Grid::Mesh(grid)) = slim_file.1.grid else {
             unimplemented!();
         };
 
         if let Some(ref p) = self.medial_axes {
-            grid.recompute_dim_dist();
-            let mut f = std::fs::File::create(p).context("create passed file")?;
-            info!("Write medial axes to {}", p.display());
-
-            let mut vi = 0;
-            let mut skipped = 0;
-            for dim in 0..3 {
-                let swaps = &swaps[dim];
-
-                writeln!(&mut f, "o ma-dim-{}", dim)?;
-
-                for (gi, gj, swaps) in swaps {
-                    if 0 < swaps.len() {
-                        let pts = grid.dual_face_points(*gi, *gj);
-                        if !write_face(&mut f, &pts, &mut vi)? {
-                            skipped += 1;
-                        }
-                    }
-                }
-            }
-            if skipped > 0 {
-                warn!(
-                    "{} swap-bearing grid edges had no dual face and were not written",
-                    skipped
-                );
-            }
+            let edges = swaps.each_ref().map(|dim| {
+                dim.iter()
+                    .filter(|(_, _, s)| !s.is_empty())
+                    .map(|(a, b, _)| (*a, *b))
+                    .collect()
+            });
+            write_axes_obj(p, edges, |a, b| grid.dual_face_points(a, b))?;
         }
 
         if self.complex.is_some() || self.grid.is_some() {
@@ -354,7 +357,7 @@ impl ObjArgs {
         }
 
         let bytes = std::fs::read(&self.state).context("read state file")?;
-        let (mut mars, vin): (mars_core::Mars, mars_core::Vineyards) =
+        let (mars, vin): (mars_core::Mars, mars_core::Vineyards) =
             rmp_serde::from_slice(&bytes).context("rmp read")?;
 
         if let Some(ref p) = self.complex {
@@ -388,48 +391,20 @@ impl ObjArgs {
         }
 
         if let Some(ref p) = self.medial_axes {
-            let mut f = std::fs::File::create(p).context("create passed file")?;
-
-            info!("Write medial axes to {}", p.display());
-            let mut vi = 0;
-            let mut skipped = 0;
-            for dim in 0..3 {
-                let swaps = &vin.swaps[dim];
-
-                writeln!(&mut f, "o ma-dim-{}", dim)?;
-
-                match mars
-                    .grid
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("missing grid in state"))?
-                {
-                    Grid::Regular(grid) => {
-                        for s in swaps {
-                            if 0 < s.2.v.len() {
-                                let pts = grid.dual_quad_points(s.0, s.1);
-                                write_face(&mut f, &pts, &mut vi)?;
-                            }
-                        }
-                    }
-                    Grid::Mesh(grid) => {
-                        grid.recompute_dim_dist();
-                        for s in swaps {
-                            if 0 < s.2.v.len() {
-                                let pts = grid.dual_face_points(s.0, s.1);
-                                if !write_face(&mut f, &pts, &mut vi)? {
-                                    skipped += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if skipped > 0 {
-                warn!(
-                    "{} swap-bearing grid edges had no dual face and were not written",
-                    skipped
-                );
-            }
+            let grid = mars
+                .grid
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing grid in state"))?;
+            let edges = vin.swaps.each_ref().map(|dim| {
+                dim.iter()
+                    .filter(|s| !s.2.v.is_empty())
+                    .map(|s| (s.0, s.1))
+                    .collect()
+            });
+            write_axes_obj(p, edges, |a, b| match grid {
+                Grid::Regular(g) => g.dual_quad_points(a, b).to_vec(),
+                Grid::Mesh(g) => g.dual_face_points(a, b),
+            })?;
         }
 
         Ok(())
@@ -624,7 +599,7 @@ impl RunArgs {
             .map_err(|e| anyhow!(e))
             .context("failed to read complex")?;
 
-        let (mesh_grid, _report) = load_grid(&self.mesh_path, self.dual_path.as_ref())?;
+        let (mesh_grid, _report) = load_grid(&self.mesh_path, self.dual_path.as_deref())?;
 
         let mars = mars_core::Mars {
             complex: Some(complex),
@@ -692,7 +667,7 @@ fn run(args: &RunArgs) -> Result<()> {
         .map_err(|e| anyhow!(e))
         .context("failed to read complex")?;
 
-    let (mesh_grid, _report) = load_grid(&args.mesh_path, args.dual_path.as_ref())?;
+    let (mesh_grid, _report) = load_grid(&args.mesh_path, args.dual_path.as_deref())?;
 
     let mars = mars_core::Mars {
         complex: Some(complex),

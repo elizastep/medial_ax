@@ -314,7 +314,7 @@ impl Api {
     }
 
     /// Flattened coordinates for every face of the computed medial axes, GL style.
-    pub fn medial_axes_face_positions(&mut self, dim: usize) -> Result<Vec<f32>, String> {
+    pub fn medial_axes_face_positions(&self, dim: usize) -> Result<Vec<f32>, String> {
         let mut out: Vec<f64> = Vec::new();
         let Some(ref g) = self.core.grid else {
             return Ok(Vec::new());
@@ -380,7 +380,11 @@ impl Api {
             if 0 < s.2.v.len() {
                 let triangles = match g {
                     Grid::Regular(_) => 2,
-                    Grid::Mesh(grid) => grid.dual_face_points(s.0, s.1).len().saturating_sub(2),
+                    Grid::Mesh(grid) => match grid.dual_face(s.0, s.1) {
+                        Some(face) => face.vertices.len().saturating_sub(2),
+                        None if grid.has_dual() => 0,
+                        None => grid.dual_quad_points(s.0, s.1).map_or(0, |_| 2),
+                    },
                 };
                 if face_index < first_triangle + triangles {
                     return serde_wasm_bindgen::to_value(&(s.0, s.1, &s.2.v))

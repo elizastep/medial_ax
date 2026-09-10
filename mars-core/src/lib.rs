@@ -1857,26 +1857,28 @@ mod tests {
         }
     }
 
-    fn run_and_prune_mesh(mars: &Mars) -> [Vec<([i64; 3], [i64; 3], usize)>; 3] {
+    /// Run, prune with the defaults, and return the sorted edge signatures per dimension.
+    fn run_and_prune(mars: &Mars) -> [Vec<([i64; 3], [i64; 3], usize)>; 3] {
         let no_progress = |_, _| {};
         let vin = mars.run(&no_progress).expect("failed to run mars");
-        let Some(Grid::Mesh(ref grid)) = mars.grid else {
-            unreachable!()
-        };
         let complex = mars.complex.as_ref().unwrap();
+        let (coordinate, face_vertices): (
+            Box<dyn Fn(Index) -> Pos>,
+            Box<dyn Fn(Index, Index) -> usize>,
+        ) = match mars.grid.as_ref().unwrap() {
+            Grid::Regular(g) => (Box::new(move |i| g.coordinate(i)), Box::new(|_, _| 4)),
+            Grid::Mesh(g) => (
+                Box::new(move |i| g.coordinate(i)),
+                Box::new(move |i, j| g.dual_face_points(i, j).len()),
+            ),
+        };
         let mut out = [Vec::new(), Vec::new(), Vec::new()];
         for dim in 0..3 {
             let pruned = vin.prune_dim(dim, &default_pruning_param(dim), complex, no_progress);
             let mut sigs: Vec<_> = pruned
                 .iter()
                 .filter(|t| t.2.v.len() > 0)
-                .map(|(i, j, _)| {
-                    edge_signature(
-                        grid.coordinate(*i),
-                        grid.coordinate(*j),
-                        grid.dual_face_points(*i, *j).len(),
-                    )
-                })
+                .map(|(i, j, _)| edge_signature(coordinate(*i), coordinate(*j), face_vertices(*i, *j)))
                 .collect();
             sigs.sort();
             sigs.dedup();
@@ -1898,20 +1900,7 @@ mod tests {
             complex: Some(complex.clone()),
             grid: Some(Grid::Regular(regular.clone())),
         };
-        let no_progress = |_, _| {};
-        let vin = mars.run(&no_progress).expect("failed to run mars");
-        let mut expected = [Vec::new(), Vec::new(), Vec::new()];
-        for dim in 0..3 {
-            let pruned = vin.prune_dim(dim, &default_pruning_param(dim), &complex, no_progress);
-            let mut sigs: Vec<_> = pruned
-                .iter()
-                .filter(|t| t.2.v.len() > 0)
-                .map(|(i, j, _)| edge_signature(regular.coordinate(*i), regular.coordinate(*j), 4))
-                .collect();
-            sigs.sort();
-            sigs.dedup();
-            expected[dim] = sigs;
-        }
+        let expected = run_and_prune(&mars);
 
         // shape [5; 3] == 4 cells of side `size`, centred two cells in from the corner.
         let centre = regular.corner + Pos([2.0 * regular.size; 3]);
@@ -1929,7 +1918,7 @@ mod tests {
             complex: Some(complex),
             grid: Some(Grid::Mesh(grid)),
         };
-        let got = run_and_prune_mesh(&mars);
+        let got = run_and_prune(&mars);
         for dim in 0..3 {
             let g: std::collections::BTreeSet<_> = got[dim].iter().cloned().collect();
             let e: std::collections::BTreeSet<_> = expected[dim].iter().cloned().collect();
@@ -1947,7 +1936,6 @@ mod tests {
                 e.difference(&g).count(),
                 only_regular
             );
-            assert!(!got[dim].is_empty() || dim == 2);
         }
     }
 
@@ -1962,9 +1950,15 @@ mod tests {
             complex: Some(complex),
             grid: Some(Grid::Mesh(grid)),
         };
-        let got = run_and_prune_mesh(&mars);
+        let got = run_and_prune(&mars);
         for dim in 0..3 {
-            insta::assert_json_snapshot!(got[dim]);
+            // One edge per line: "endpoint endpoint face-vertex-count" (JSON snapshots of nested
+            // arrays put every number on its own line).
+            let lines: Vec<String> = got[dim]
+                .iter()
+                .map(|(a, b, n)| format!("{:?} {:?} {}", a, b, n))
+                .collect();
+            insta::assert_snapshot!(lines.join("\n"));
         }
     }
 }

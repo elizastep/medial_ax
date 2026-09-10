@@ -155,21 +155,20 @@ impl LatticeBlock {
 /// `n = [nx, ny, nz]` conventional cells of side `a`, block centred at `centre`.  The block is
 /// closed: points on its far faces are included.
 pub fn lattice_block(kind: Lattice, n: [usize; 3], a: f64, centre: Pos) -> LatticeBlock {
+    lattice_block_culled(kind, n, a, centre, |_| true)
+}
+
+/// [lattice_block] keeping only the points for which `keep` holds (the add-on's "Cull to
+/// inside").  Edges and walls that need a culled point go with it; a wall towards a culled point
+/// becomes an outer wall.
+pub fn lattice_block_culled(
+    kind: Lattice,
+    n: [usize; 3],
+    a: f64,
+    centre: Pos,
+    keep: impl Fn(Pos) -> bool,
+) -> LatticeBlock {
     let lim = [2 * n[0] as i64, 2 * n[1] as i64, 2 * n[2] as i64];
-    let mut ys: Vec<[i64; 3]> = Vec::new();
-    for i in 0..=n[0] as i64 {
-        for j in 0..=n[1] as i64 {
-            for k in 0..=n[2] as i64 {
-                for off in kind.basis_y() {
-                    let p = [2 * i + off[0], 2 * j + off[1], 2 * k + off[2]];
-                    if p[0] <= lim[0] && p[1] <= lim[1] && p[2] <= lim[2] {
-                        ys.push(p);
-                    }
-                }
-            }
-        }
-    }
-    let index: HashMap<[i64; 3], usize> = ys.iter().enumerate().map(|(i, p)| (*p, i)).collect();
     let offset = Pos([
         n[0] as f64 * a / 2.0,
         n[1] as f64 * a / 2.0,
@@ -177,6 +176,21 @@ pub fn lattice_block(kind: Lattice, n: [usize; 3], a: f64, centre: Pos) -> Latti
     ]);
     let real_y = |p: [i64; 3]| to_pos(p) * (a / 2.0) - offset + centre;
     let real_z = |k: [i64; 3]| to_pos(k) * (a / 4.0) - offset + centre;
+
+    let mut ys: Vec<[i64; 3]> = Vec::new();
+    for i in 0..=n[0] as i64 {
+        for j in 0..=n[1] as i64 {
+            for k in 0..=n[2] as i64 {
+                for off in kind.basis_y() {
+                    let p = [2 * i + off[0], 2 * j + off[1], 2 * k + off[2]];
+                    if p[0] <= lim[0] && p[1] <= lim[1] && p[2] <= lim[2] && keep(real_y(p)) {
+                        ys.push(p);
+                    }
+                }
+            }
+        }
+    }
+    let index: HashMap<[i64; 3], usize> = ys.iter().enumerate().map(|(i, p)| (*p, i)).collect();
 
     let points: Vec<Pos> = ys.iter().map(|&p| real_y(p)).collect();
 
@@ -252,8 +266,6 @@ pub struct ObjOptions {
     pub lines: Lines,
     /// Write the dual object at all.
     pub dual: bool,
-    /// Include the outer walls of the boundary cells.
-    pub include_outer: bool,
     /// Write `vn` lines and `f a//n` syntax, as Blender does for objects with faces.
     pub normals: bool,
     /// Round coordinates like Blender's exporter.
@@ -269,7 +281,6 @@ impl Default for ObjOptions {
         Self {
             lines: Lines::Both,
             dual: true,
-            include_outer: true,
             normals: false,
             decimals: None,
             duplicate_walls: false,
@@ -318,10 +329,7 @@ pub fn block_to_obj(block: &LatticeBlock, o: &ObjOptions) -> String {
                 .collect();
             format!("f {}\n", toks.join(" "))
         };
-        for (_, j, ids) in &block.walls {
-            if j.is_none() && !o.include_outer {
-                continue;
-            }
+        for (_, _, ids) in &block.walls {
             if o.triangulate {
                 for k in 1..ids.len() - 1 {
                     s += &face_line(&[ids[0], ids[k], ids[k + 1]]);

@@ -459,62 +459,70 @@ pub struct VineyardsGridMesh {
     /// dual faces are the axis-aligned squares of [Self::dual_quad_points].
     ///
     /// Serialized last, with a default, so that state files written before this field existed
-    /// still load (rmp_serde encodes structs positionally).  Do not mutate directly after
-    /// construction: the lookup index is built lazily from it.
+    /// still load (rmp_serde encodes structs positionally).  Private because the lookup index
+    /// below is built from it once; see [Self::dual_faces] and [Self::set_dual_faces].
     #[serde(default)]
-    pub dual_faces: Vec<DualFace>,
-
-    /// Grid distances along the three axes, assuming the mesh is a subset of a regular grid.
-    /// Only used by the legacy square rule.
-    #[serde(skip)]
-    pub dim_dist: Option<(f64, f64, f64)>,
+    dual_faces: Vec<DualFace>,
 
     /// Lazily built lookup from `(a, b)` with `a < b` into `dual_faces`.
     #[serde(skip)]
     dual_index: std::sync::OnceLock<HashMap<(isize, isize), usize>>,
+
+    /// Lazily inferred grid spacing along the three axes, for the legacy square rule (which
+    /// assumes the mesh is a subset of a regular grid).  See [Self::dim_dist].
+    #[serde(skip)]
+    dim_dist: std::sync::OnceLock<Option<(f64, f64, f64)>>,
 }
 
 impl VineyardsGridMesh {
     pub fn empty() -> Self {
-        Self {
-            points: Vec::new(),
-            neighbors: Vec::new(),
-            r#type: "meshgrid".to_string(),
-            dual_faces: Vec::new(),
-            dim_dist: None,
-            dual_index: Default::default(),
-        }
+        Self::with_parts(Vec::new(), Vec::new(), Vec::new())
     }
 
-    /// Build a grid from points, undirected edges and dual faces.  Edges implied by the dual faces
-    /// are added after the given ones.
-    pub fn from_parts(points: Vec<Pos>, edges: &[(usize, usize)], dual_faces: Vec<DualFace>) -> Self {
-        let mut neighbors: Vec<Vec<isize>> = vec![Vec::new(); points.len()];
-        let mut seen = HashSet::new();
-        let mut add = |a: usize, b: usize| {
-            if a != b && seen.insert((a.min(b), a.max(b))) {
-                neighbors[a].push(b as isize);
-                neighbors[b].push(a as isize);
-            }
-        };
-        for &(a, b) in edges {
-            add(a, b);
-        }
-        for f in &dual_faces {
-            add(f.a as usize, f.b as usize);
-        }
+    fn with_parts(points: Vec<Pos>, neighbors: Vec<Vec<isize>>, dual_faces: Vec<DualFace>) -> Self {
         Self {
             points,
             neighbors,
             r#type: "meshgrid".to_string(),
             dual_faces,
-            dim_dist: None,
             dual_index: Default::default(),
+            dim_dist: Default::default(),
         }
     }
 
     pub fn coordinate(&self, index: Index) -> Pos {
         self.points[index.0[0] as usize]
+    }
+
+    /// The supplied dual faces, one per edge that has one.
+    pub fn dual_faces(&self) -> &[DualFace] {
+        &self.dual_faces
+    }
+
+    /// Replace the dual faces (and reset the lookup index built from them).
+    pub fn set_dual_faces(&mut self, faces: Vec<DualFace>) {
+        self.dual_faces = faces;
+        self.dual_index = Default::default();
+    }
+
+    /// Grid spacing along the three axes for the legacy square rule: the length of the first
+    /// edge that differs in x, in y and in z (in adjacency order).  `None` if some axis has no
+    /// such edge.  Inferred once from the adjacency, so it is available however the grid was
+    /// constructed or loaded.
+    pub fn dim_dist(&self) -> Option<(f64, f64, f64)> {
+        *self.dim_dist.get_or_init(|| {
+            let first = |axis: usize| {
+                self.neighbors.iter().enumerate().find_map(|(i, ns)| {
+                    ns.iter()
+                        .find(|&&j| self.points[i].0[axis] != self.points[j as usize].0[axis])
+                        .map(|&j| self.points[i].dist(&self.points[j as usize]))
+                })
+            };
+            match (first(0), first(1), first(2)) {
+                (Some(dx), Some(dy), Some(dz)) => Some((dx, dy, dz)),
+                _ => None,
+            }
+        })
     }
 
     /// True if the grid came with dual faces.
@@ -541,8 +549,8 @@ impl VineyardsGridMesh {
     /// Polygon of the dual face of the grid edge `(a, b)`, in cyclic order.
     ///
     /// This is the supplied Voronoi facet if the grid came with a dual, otherwise the legacy
-    /// axis-aligned square of [Self::dual_quad_points].  Returns an empty polygon (and logs a
-    /// warning) if the edge has no face; callers should skip such faces.
+    /// axis-aligned square of [Self::dual_quad_points].  Returns an empty polygon if the edge has
+    /// no face; callers should skip (and count) such faces.
     pub fn dual_face_points(&self, a: Index, b: Index) -> Vec<Pos> {
         if let Some(face) = self.dual_face(a, b) {
             return face.vertices.clone();
@@ -575,7 +583,7 @@ impl VineyardsGridMesh {
     pub fn dual_quad_points(&self, a: Index, b: Index) -> Option<[Pos; 4]> {
         let a = self.points[a.0[0] as usize];
         let b = self.points[b.0[0] as usize];
-        let (dx, dy, dz) = self.dim_dist.unwrap_or_else(|| {
+        let (dx, dy, dz) = self.dim_dist().unwrap_or_else(|| {
             let dist = a.dist(&b);
             (dist, dist, dist)
         });
@@ -664,22 +672,8 @@ impl VineyardsGridMesh {
 
         // The halves only drive the traversal; dual faces are read from the full grid at export.
         (
-            VineyardsGridMesh {
-                points: self.points.clone(),
-                neighbors: lower_edges,
-                r#type: self.r#type.clone(),
-                dual_faces: Vec::new(),
-                dim_dist: None,
-                dual_index: Default::default(),
-            },
-            VineyardsGridMesh {
-                points: self.points.clone(),
-                neighbors: upper_edges,
-                r#type: self.r#type.clone(),
-                dual_faces: Vec::new(),
-                dim_dist: None,
-                dual_index: Default::default(),
-            },
+            Self::with_parts(self.points.clone(), lower_edges, Vec::new()),
+            Self::with_parts(self.points.clone(), upper_edges, Vec::new()),
         )
     }
 
@@ -848,10 +842,11 @@ impl VineyardsGridMesh {
 
     /// Read a grid, and optionally its dual, from the text of an `.obj` file.
     ///
-    /// The file may contain several objects (`o` lines).  Objects with `f` lines and no `l`
-    /// lines are taken to be the **dual**: the Voronoi tessellation of the grid points.  Every
-    /// other object contributes grid points (`v`) and edges (`l`); faces in such an object are
-    /// ignored, as they always were.  A file without faces is a plain grid, exactly as before.
+    /// The file may contain several objects (`o` or `g` lines).  Objects with `f` lines are the
+    /// **dual**: the Voronoi tessellation of the grid points.  Every other object contributes grid
+    /// points (`v`) and edges (`l`).  An object with both faces and edges is an error, because
+    /// either reading of it would be silently wrong.  A file without faces is a plain grid,
+    /// exactly as before.
     ///
     /// Each dual face is linked to the grid edge it bisects by geometry: the two grid points
     /// nearest to the face's centroid are the edge, and every vertex of the face must be
@@ -874,20 +869,26 @@ impl VineyardsGridMesh {
         let mut faces: Vec<Vec<Pos>> = Vec::new();
 
         for o in &obj.objects {
-            if o.is_dual() {
+            if !o.faces.is_empty() {
+                // A dual object.  Faces and edges in one object would be misread either way (a
+                // grid without its dual, or a dual whose corners become grid points), so refuse.
+                if !o.lines.is_empty() {
+                    return Err(format!(
+                        "object {:?} has both {} faces and {} edges. The dual (faces) and the grid \
+                         (edges) must be separate objects: if this is the lattice, regenerate it \
+                         with Delaunay faces = None; if this is the Voronoi object, delete its \
+                         loose edges; if Blender merged the two, export them as separate objects.",
+                        o.name,
+                        o.faces.len(),
+                        o.lines.len()
+                    ));
+                }
                 faces.extend(
                     o.faces
                         .iter()
                         .map(|f| f.iter().map(|&v| obj.vertices[v]).collect::<Vec<_>>()),
                 );
                 continue;
-            }
-            if !o.faces.is_empty() {
-                warn!(
-                    "object {:?} has edges and {} faces; the faces are ignored (a dual object must contain faces only)",
-                    o.name,
-                    o.faces.len()
-                );
             }
             for &v in &o.vertices {
                 point_of_vertex[v] = Some(points.len());
@@ -934,8 +935,14 @@ impl VineyardsGridMesh {
                 }
             }
         }
-        let points = std::mem::take(&mut self.points);
-        let (grid, report) = Self::assemble(points, edges, faces)?;
+        if self.has_dual() {
+            warn!(
+                "the grid already had {} dual faces; the separate dual file replaces them, but \
+                 the edges they implied stay",
+                self.dual_faces.len()
+            );
+        }
+        let (grid, report) = Self::assemble(self.points.clone(), edges, faces)?;
         *self = grid;
         Ok(report)
     }
@@ -991,72 +998,7 @@ impl VineyardsGridMesh {
         }
         report.degree_histogram = histogram(neighbors.iter().map(|n| n.len()));
 
-        // The legacy square rule needs the lattice spacing; pick it exactly as before.
-        let dim_dist = if dual_faces.is_empty() {
-            infer_dim_dist(&points, &line_edges)
-        } else {
-            None
-        };
-
-        Ok((
-            Self {
-                points,
-                neighbors,
-                r#type: "meshgrid".to_string(),
-                dual_faces,
-                dim_dist,
-                dual_index: Default::default(),
-            },
-            report,
-        ))
-    }
-
-    pub fn recompute_dim_dist(&mut self) {
-        if self.dim_dist.is_some() {
-            return;
-        }
-        let xs = self
-            .neighbors
-            .iter()
-            .enumerate()
-            .flat_map(|(i, n)| {
-                n.iter()
-                    .find(|j| self.points[i].x() != self.points[**j as usize].x())
-                    .map(|j| (i, *j as usize))
-            })
-            .next();
-        let ys = self
-            .neighbors
-            .iter()
-            .enumerate()
-            .flat_map(|(i, n)| {
-                n.iter()
-                    .find(|j| self.points[i].y() != self.points[**j as usize].y())
-                    .map(|j| (i, *j as usize))
-            })
-            .next();
-        let zs = self
-            .neighbors
-            .iter()
-            .enumerate()
-            .flat_map(|(i, n)| {
-                n.iter()
-                    .find(|j| self.points[i].z() != self.points[**j as usize].z())
-                    .map(|j| (i, *j as usize))
-            })
-            .next();
-
-        let dim_dist = if let (Some((xi, xj)), Some((yi, yj)), Some((zi, zj))) = (xs, ys, zs) {
-            Some((
-                (self.points[xi as usize].dist(&self.points[xj as usize])),
-                (self.points[yi as usize].dist(&self.points[yj as usize])),
-                (self.points[zi as usize].dist(&self.points[zj as usize])),
-            ))
-        } else {
-            None
-        };
-
-        self.dim_dist = dim_dist;
+        Ok((Self::with_parts(points, neighbors, dual_faces), report))
     }
 
     /// Write the grid as an `.obj`: an object `grid` with the points and edges, and, if there are
@@ -1084,20 +1026,35 @@ impl VineyardsGridMesh {
             writeln!(w, "o dual")?;
             let mut vi = self.points.len();
             for face in &self.dual_faces {
-                for p in &face.vertices {
-                    writeln!(w, "v {} {} {}", p.x(), p.y(), p.z())?;
-                }
-                let ids = (1..=face.vertices.len())
-                    .map(|k| (vi + k).to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                writeln!(w, "f {}", ids)?;
-                vi += face.vertices.len();
+                write_face(&mut w, &face.vertices, &mut vi)?;
             }
         }
 
         Ok(())
     }
+}
+
+/// Write one polygon as `.obj`: its vertices as `v` lines and one `f` line referring to them.
+/// `vi` is the number of vertices written to `w` so far and is advanced.  Polygons with fewer
+/// than three vertices are skipped, returning `false`.
+pub fn write_face<W: std::io::Write>(
+    w: &mut W,
+    pts: &[Pos],
+    vi: &mut usize,
+) -> std::io::Result<bool> {
+    if pts.len() < 3 {
+        return Ok(false);
+    }
+    for p in pts {
+        writeln!(w, "v {} {} {}", p.x(), p.y(), p.z())?;
+    }
+    write!(w, "f")?;
+    for k in 1..=pts.len() {
+        write!(w, " {}", *vi + k)?;
+    }
+    writeln!(w)?;
+    *vi += pts.len();
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1125,11 +1082,6 @@ struct ObjObject {
 impl ObjObject {
     fn is_empty(&self) -> bool {
         self.vertices.is_empty() && self.lines.is_empty() && self.faces.is_empty()
-    }
-
-    /// Dual objects carry faces and no edges.
-    fn is_dual(&self) -> bool {
-        !self.faces.is_empty() && self.lines.is_empty()
     }
 }
 
@@ -1161,6 +1113,13 @@ impl ObjFile {
                             .parse::<f64>()
                             .map_err(|e| format!("line {}: {}", lineno, e))?;
                     }
+                    if !c.iter().all(|x| x.is_finite()) {
+                        return Err(format!(
+                            "line {}: vertex with a non-finite coordinate: {:?}",
+                            lineno,
+                            raw.trim()
+                        ));
+                    }
                     let id = file.vertices.len();
                     file.vertices.push(Pos(c));
                     file.objects.last_mut().unwrap().vertices.push(id);
@@ -1176,7 +1135,8 @@ impl ObjFile {
                     let ids = parse_indices(toks, file.vertices.len(), lineno)?;
                     file.objects.last_mut().unwrap().faces.push(ids);
                 }
-                "o" => {
+                // Blender writes `o` per object, or `g` with "Objects as OBJ Groups".
+                "o" | "g" => {
                     let name = toks.collect::<Vec<_>>().join(" ");
                     let last = file.objects.last_mut().unwrap();
                     if last.is_empty() {
@@ -1188,7 +1148,7 @@ impl ObjFile {
                         });
                     }
                 }
-                // Comments, `vn`, `vt`, `s`, `g`, `usemtl`, `mtllib`, ...
+                // Comments, `vn`, `vt`, `s`, `usemtl`, `mtllib`, ...
                 _ => {}
             }
         }
@@ -1227,44 +1187,37 @@ fn parse_indices<'a>(
     .collect()
 }
 
-/// Error if two points are closer than 1e-5.  Sort-and-sweep along x.
+/// Error if two points are closer than 1e-5.  Points are bucketed on a 1e-5 lattice and compared
+/// with the 27 surrounding buckets, so this is linear in the number of points (a sort-and-sweep
+/// along one axis is quadratic per slab on axis-aligned lattices).
 fn check_distinct_points(points: &[Pos]) -> Result<(), String> {
-    let mut order: Vec<usize> = (0..points.len()).collect();
-    order.sort_by(|&i, &j| {
-        points[i]
-            .x()
-            .partial_cmp(&points[j].x())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for (k, &i) in order.iter().enumerate() {
-        for &j in &order[k + 1..] {
-            if points[j].x() - points[i].x() >= 1e-5 {
-                break;
-            }
-            if points[i].dist(&points[j]) < 1e-5 {
-                return Err(format!(
-                    "Two grid vertices are too close together: {} and {}",
-                    i.min(j),
-                    i.max(j)
-                ));
+    const TOL: f64 = 1e-5;
+    let key = |p: &Pos| {
+        let f = |k: usize| (p.0[k] / TOL).round() as i64;
+        (f(0), f(1), f(2))
+    };
+    let mut buckets: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::with_capacity(points.len());
+    for (i, p) in points.iter().enumerate() {
+        let (kx, ky, kz) = key(p);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(bucket) = buckets.get(&(kx + dx, ky + dy, kz + dz)) {
+                        for &j in bucket {
+                            if points[j].dist(p) < TOL {
+                                return Err(format!(
+                                    "Two grid vertices are too close together: {} and {}",
+                                    j, i
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
+        buckets.entry((kx, ky, kz)).or_default().push(i);
     }
     Ok(())
-}
-
-/// The legacy lattice spacing: the length of the first edge that differs in x, in y and in z.
-fn infer_dim_dist(points: &[Pos], edges: &[(usize, usize)]) -> Option<(f64, f64, f64)> {
-    let find = |axis: usize| {
-        edges
-            .iter()
-            .find(|(i, j)| points[*i].0[axis] != points[*j].0[axis])
-            .map(|(i, j)| points[*i].dist(&points[*j]))
-    };
-    match (find(0), find(1), find(2)) {
-        (Some(dx), Some(dy), Some(dz)) => Some((dx, dy, dz)),
-        _ => None,
-    }
 }
 
 /// `(value, count)` pairs, sorted by value.
@@ -1284,36 +1237,48 @@ fn centroid(vs: &[Pos]) -> Pos {
     c / vs.len() as f64
 }
 
-/// Drop consecutive (cyclically) vertices closer than `tol`.
-fn dedupe_cyclic(vs: &[Pos], tol: f64) -> Vec<Pos> {
+/// Drop vertices that repeat an earlier one within `tol`, consecutive or not, keeping the first
+/// occurrence.  A polygon that lists a vertex twice is degenerate; removing the repeat is the
+/// most useful reading of it.
+fn dedupe_vertices(vs: &[Pos], tol: f64) -> Vec<Pos> {
     let mut out: Vec<Pos> = Vec::with_capacity(vs.len());
     for &v in vs {
-        if out.last().map_or(true, |l| l.dist(&v) > tol) {
+        if !out.iter().any(|o| o.dist(&v) <= tol) {
             out.push(v);
         }
-    }
-    while out.len() > 1 && out[0].dist(out.last().unwrap()) <= tol {
-        out.pop();
     }
     out
 }
 
-/// True if every vertex of `p` has a vertex of `q` within `tol` and the counts agree.
+/// True if `p` and `q` hold the same vertices, as multisets, within `tol`.
 fn same_vertex_set(p: &[Pos], q: &[Pos], tol: f64) -> bool {
-    p.len() == q.len() && p.iter().all(|a| q.iter().any(|b| a.dist(b) <= tol))
+    if p.len() != q.len() {
+        return false;
+    }
+    let mut used = vec![false; q.len()];
+    p.iter().all(|a| {
+        match (0..q.len()).find(|&k| !used[k] && a.dist(&q[k]) <= tol) {
+            Some(k) => {
+                used[k] = true;
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Nearest-neighbour queries over the grid points through a uniform spatial hash.
 struct PointLocator<'a> {
     points: &'a [Pos],
-    origin: Pos,
+    lo: Pos,
+    hi: Pos,
+    /// Hash cell size, about one nearest-neighbour spacing.
     cell: f64,
-    /// Diagonal of the bounding box.
-    extent: f64,
     cells: HashMap<(i64, i64, i64), Vec<usize>>,
 }
 
 impl<'a> PointLocator<'a> {
+    /// `points` must hold at least two finite points.
     fn new(points: &'a [Pos]) -> Self {
         let mut lo = Pos([f64::MAX; 3]);
         let mut hi = Pos([f64::MIN; 3]);
@@ -1323,78 +1288,80 @@ impl<'a> PointLocator<'a> {
                 hi.0[k] = hi.0[k].max(p.0[k]);
             }
         }
-        if points.is_empty() {
-            lo = Pos([0.0; 3]);
-            hi = Pos([0.0; 3]);
-        }
-        let extent = lo.dist(&hi);
         let cell = estimate_spacing(points)
-            .max(extent * 1e-9)
+            .max(lo.dist(&hi) * 1e-9)
             .max(f64::MIN_POSITIVE);
-        let mut me = Self {
-            points,
-            origin: lo,
-            cell,
-            extent,
-            cells: HashMap::new(),
-        };
         let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
         for (i, p) in points.iter().enumerate() {
-            cells.entry(me.key(*p)).or_default().push(i);
+            cells.entry(hash_key(p, &lo, cell)).or_default().push(i);
         }
-        me.cells = cells;
-        me
+        Self {
+            points,
+            lo,
+            hi,
+            cell,
+            cells,
+        }
     }
 
-    fn key(&self, p: Pos) -> (i64, i64, i64) {
-        let f = |k: usize| ((p.0[k] - self.origin.0[k]) / self.cell).floor() as i64;
-        (f(0), f(1), f(2))
+    /// True if `p` lies more than `margin` outside the bounding box of the points.
+    fn is_far_outside(&self, p: Pos, margin: f64) -> bool {
+        (0..3).any(|k| p.0[k] < self.lo.0[k] - margin || p.0[k] > self.hi.0[k] + margin)
     }
 
-    /// The two grid points nearest to `c`, nearest first.  `None` with fewer than two points.
+    /// The two grid points nearest to `c`, nearest first.  `None` only if fewer than two points
+    /// have a finite distance to `c`.
     fn two_nearest(&self, c: Pos) -> Option<(usize, usize)> {
-        if self.points.len() < 2 {
-            return None;
-        }
-        let pick = |best: &mut [(f64, usize); 2], i: usize| {
-            let d = self.points[i].dist2(&c);
+        fn pick(points: &[Pos], c: &Pos, best: &mut [(f64, usize); 2], i: usize) {
+            let d = points[i].dist2(c);
             if d < best[0].0 {
                 best[1] = best[0];
                 best[0] = (d, i);
             } else if d < best[1].0 {
                 best[1] = (d, i);
             }
-        };
+        }
+        let n = self.points.len();
+        let mut best = [(f64::INFINITY, usize::MAX); 2];
+        let (kx, ky, kz) = hash_key(&c, &self.lo, self.cell);
 
-        let (kx, ky, kz) = self.key(c);
-        // Every point within `r * cell` of `c` lies in the (2r+1)^3 cells around `c`'s cell, so
-        // once the second-nearest candidate is closer than that the answer is final.
-        let everything = c.dist(&self.origin) + self.extent;
-        for r in 1..=64i64 {
-            let mut best = [(f64::INFINITY, usize::MAX); 2];
+        // Grow a cube of cells around `c`, visiting each shell once.  Every point within
+        // `r * cell` of `c` lies in the (2r+1)^3 cube, so once the second-nearest candidate is
+        // closer than that the answer is final.  When the cube holds more cells than there are
+        // points, scanning the points directly is cheaper (and always correct).
+        let mut r: i64 = 0;
+        while (2 * r + 1).pow(3) <= n as i64 {
             for dx in -r..=r {
                 for dy in -r..=r {
                     for dz in -r..=r {
+                        if dx.abs() != r && dy.abs() != r && dz.abs() != r {
+                            continue; // strictly inside the shell: seen in an earlier round
+                        }
                         if let Some(bucket) = self.cells.get(&(kx + dx, ky + dy, kz + dz)) {
                             for &i in bucket {
-                                pick(&mut best, i);
+                                pick(self.points, &c, &mut best, i);
                             }
                         }
                     }
                 }
             }
-            let covered = r as f64 * self.cell;
-            if best[1].0.is_finite() && (best[1].0.sqrt() <= covered || covered >= everything) {
+            if best[1].1 != usize::MAX && best[1].0.sqrt() <= r as f64 * self.cell {
                 return Some((best[0].1, best[1].1));
             }
+            r += 1;
         }
-        // Far away from all points: brute force.
+        // Scan everything, from scratch: re-picking a point already in `best` would enter it twice.
         let mut best = [(f64::INFINITY, usize::MAX); 2];
-        for i in 0..self.points.len() {
-            pick(&mut best, i);
+        for i in 0..n {
+            pick(self.points, &c, &mut best, i);
         }
-        Some((best[0].1, best[1].1))
+        (best[1].1 != usize::MAX).then(|| (best[0].1, best[1].1))
     }
+}
+
+fn hash_key(p: &Pos, lo: &Pos, cell: f64) -> (i64, i64, i64) {
+    let f = |k: usize| ((p.0[k] - lo.0[k]) / cell).floor() as i64;
+    (f(0), f(1), f(2))
 }
 
 /// Typical nearest-neighbour distance between grid points, from a sample.
@@ -1442,6 +1409,12 @@ fn match_dual_faces(
     }
 
     let locator = PointLocator::new(points);
+    // Blender stores float32 and writes six decimals, so far from the origin the absolute error
+    // grows with the coordinates: the tolerances get a floor proportional to them.
+    let coord_scale = points
+        .iter()
+        .flat_map(|p| p.0)
+        .fold(0.0f64, |m, x| m.max(x.abs()));
     let mut out: Vec<DualFace> = Vec::new();
     let mut index: HashMap<(usize, usize), usize> = HashMap::new();
 
@@ -1451,19 +1424,29 @@ fn match_dual_faces(
             continue;
         }
         let c = centroid(face);
-        let (a, b) = locator.two_nearest(c).expect("at least two points");
+        // A wall between two grid points has its centroid between them, hence inside their
+        // bounding box.  Anything well outside is an outer wall of some other cell.
+        if locator.is_far_outside(c, 2.0 * locator.cell) {
+            report.faces_dropped += 1;
+            continue;
+        }
+        let Some((a, b)) = locator.two_nearest(c) else {
+            report.faces_degenerate += 1;
+            continue;
+        };
         let (pa, pb) = (points[a], points[b]);
         let len = pa.dist(&pb);
 
-        let vertices = dedupe_cyclic(face, MERGE_TOL * len);
+        let vertices = dedupe_vertices(face, MERGE_TOL * len);
         if vertices.len() < 3 {
             report.faces_degenerate += 1;
             continue;
         }
 
+        let tol = (EQUIDISTANT_TOL * len).max(1e-6 * coord_scale);
         let equidistant = vertices
             .iter()
-            .all(|x| (x.dist(&pa) - x.dist(&pb)).abs() <= EQUIDISTANT_TOL * len);
+            .all(|x| (x.dist(&pa) - x.dist(&pb)).abs() <= tol);
         if !equidistant {
             trace!(face = fi, a, b, "dropped: not equidistant from its two nearest grid points");
             report.faces_dropped += 1;
@@ -1472,14 +1455,27 @@ fn match_dual_faces(
 
         let key = (a.min(b), a.max(b));
         if let Some(&k) = index.get(&key) {
-            if same_vertex_set(&out[k].vertices, &vertices, DUPLICATE_TOL * len) {
+            let dup_tol = (DUPLICATE_TOL * len).max(1e-6 * coord_scale);
+            if same_vertex_set(&out[k].vertices, &vertices, dup_tol) {
                 report.faces_duplicate += 1;
                 continue;
             }
+            let mismatch = vertices
+                .iter()
+                .map(|v| {
+                    out[k]
+                        .vertices
+                        .iter()
+                        .map(|w| v.dist(w))
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .fold(0.0, f64::max);
             return Err(format!(
-                "dual faces {} and {} both bisect grid edge ({}, {}) but differ. Is the dual \
-                 triangulated? Export it without triangulation.",
-                fi, k, key.0, key.1
+                "dual faces {} and {} both bisect grid edge ({}, {}) but differ: vertices up to \
+                 {:.2e} apart for an edge of length {:.2e}. Either the dual is triangulated (export \
+                 it without triangulation), or two copies of the same wall disagree by more than \
+                 {:.0e} of the edge length.",
+                fi, k, key.0, key.1, mismatch, len, DUPLICATE_TOL
             ));
         }
         index.insert(key, out.len());
@@ -1512,6 +1508,17 @@ mod tests {
         Index::fake(i as isize)
     }
 
+    /// Every inner wall matched, every outer wall dropped, nothing left unexplained.
+    fn assert_walls(r: &GridReport, block: &LatticeBlock, histogram: &[(usize, usize)]) {
+        assert_eq!(r.faces_matched, block.inner_walls());
+        assert_eq!(r.faces_dropped, block.outer_walls());
+        assert_eq!(r.faces_duplicate, 0);
+        assert_eq!(r.faces_degenerate, 0);
+        assert_eq!(r.edges_without_face, 0);
+        assert_eq!(r.faces_without_line_edge, 0);
+        assert_eq!(r.face_vertex_histogram, histogram);
+    }
+
     #[test]
     fn legacy_cylinder_grid_parses_as_before() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/cylinder_grid.obj");
@@ -1524,7 +1531,7 @@ mod tests {
         assert!(!g.has_dual());
         assert!(!r.has_dual());
         assert_eq!(r.degree_histogram, vec![(3, 8), (4, 152), (5, 894), (6, 1530)]);
-        let (dx, dy, dz) = g.dim_dist.expect("dim_dist for a legacy grid");
+        let (dx, dy, dz) = g.dim_dist().expect("dim_dist for a legacy grid");
         for d in [dx, dy, dz] {
             assert!((d - 0.13215).abs() < 1e-5, "spacing {}", d);
         }
@@ -1557,11 +1564,7 @@ mod tests {
             },
         ));
         assert_eq!(g.points.len(), 64);
-        assert_eq!(r.faces_matched, block.inner_walls());
-        assert_eq!(r.faces_dropped, block.outer_walls());
-        assert_eq!(r.edges_without_face, 0);
-        assert_eq!(r.faces_without_line_edge, 0);
-        assert_eq!(r.face_vertex_histogram, vec![(4, block.inner_walls())]);
+        assert_walls(&r, &block, &[(4, block.inner_walls())]);
         assert_eq!(edge_count(&g), edge_count(&legacy));
         for f in &g.dual_faces {
             let quad = legacy
@@ -1587,17 +1590,12 @@ mod tests {
         let (g, r) = read(&block_to_obj(&block, &ObjOptions::default()));
         assert_eq!(g.points.len(), 64 + 27);
         assert_eq!(r.faces_total, block.walls.len());
-        assert_eq!(r.faces_matched, block.inner_walls());
-        assert_eq!(r.faces_dropped, block.outer_walls());
-        assert_eq!(r.faces_duplicate, 0);
-        assert_eq!(r.faces_degenerate, 0);
-        assert_eq!(r.edges_without_face, 0);
-        assert_eq!(r.faces_without_line_edge, 0);
-        assert_eq!(r.edges, block.shell1.len() + block.shell2.len());
-        assert_eq!(
-            r.face_vertex_histogram,
-            vec![(4, block.shell2.len()), (6, block.shell1.len())]
+        assert_walls(
+            &r,
+            &block,
+            &[(4, block.shell2.len()), (6, block.shell1.len())],
         );
+        assert_eq!(r.edges, block.shell1.len() + block.shell2.len());
 
         // The block is centred on a body centre with all 14 neighbours present.
         let centre = g
@@ -1669,11 +1667,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        assert_eq!(r.faces_matched, block.inner_walls());
-        assert_eq!(r.faces_dropped, block.outer_walls());
-        assert_eq!(r.face_vertex_histogram, vec![(4, block.inner_walls())]);
-        assert_eq!(r.edges_without_face, 0);
-        assert_eq!(r.faces_without_line_edge, 0);
+        assert_walls(&r, &block, &[(4, block.inner_walls())]);
 
         let centre = g
             .points
@@ -1785,11 +1779,162 @@ mod tests {
             Pos([1.0, 0.0, 0.0]),
             Pos([1.0, 1.0, 1.0]),
         ];
-        let g = VineyardsGridMesh::from_parts(points, &[(0, 1), (0, 2)], Vec::new());
+        let (g, _) = VineyardsGridMesh::assemble(points, vec![(0, 1), (0, 2)], Vec::new()).unwrap();
         assert!(!g.has_dual());
         assert_eq!(g.dual_face_points(fake(0), fake(1)).len(), 4);
         assert!(g.dual_quad_points(fake(0), fake(2)).is_none());
         assert!(g.dual_face_points(fake(0), fake(2)).is_empty());
+    }
+
+    #[test]
+    fn edge_without_a_face_in_a_grid_with_dual_yields_nothing() {
+        let block = lattice_block(Lattice::Bcc, [2, 2, 2], 1.0, Pos([0.0; 3]));
+        let (g, _) = read(&block_to_obj(&block, &ObjOptions::default()));
+        assert!(g.has_dual());
+        // Two block corners are not neighbours and share no wall.
+        let corner = |x: f64, y: f64, z: f64| {
+            g.points
+                .iter()
+                .position(|p| p.dist(&Pos([x, y, z])) < 1e-9)
+                .expect("corner")
+        };
+        let (a, b) = (corner(-1.0, -1.0, -1.0), corner(1.0, 1.0, 1.0));
+        assert!(!g.neighbors[a].contains(&(b as isize)));
+        assert!(g.dual_face(fake(a), fake(b)).is_none());
+        assert!(g.dual_face_points(fake(a), fake(b)).is_empty());
+    }
+
+    #[test]
+    fn culled_block_keeps_only_walls_between_kept_points() {
+        // Keep the points inside a sphere: the walls to culled points become outer walls.
+        let block = lattice_block_culled(Lattice::Bcc, [4, 4, 4], 1.0, Pos([0.0; 3]), |p| {
+            p.norm() < 1.7
+        });
+        assert!(block.points.len() < 125 + 64 && block.points.len() > 20);
+        assert!(block.outer_walls() > 0);
+        let (g, r) = read(&block_to_obj(&block, &ObjOptions::default()));
+        assert_eq!(g.points.len(), block.points.len());
+        assert_eq!(r.faces_total, block.walls.len());
+        assert_eq!(r.faces_matched, block.inner_walls());
+        assert_eq!(r.faces_dropped, block.outer_walls());
+        assert_eq!(r.edges_without_face, 0);
+        assert_eq!(r.faces_without_line_edge, 0);
+        assert_eq!(edge_count(&g), block.shell1.len() + block.shell2.len());
+        // Every matched face joins two kept points that are lattice neighbours.
+        for f in g.dual_faces() {
+            let d = g.points[f.a as usize].dist(&g.points[f.b as usize]);
+            assert!((d - 1.0).abs() < 1e-9 || (d - 3f64.sqrt() / 2.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn dual_in_the_wrong_frame_matches_nothing_and_finishes_quickly() {
+        let block = lattice_block(Lattice::Bcc, [6, 6, 6], 1.0, Pos([0.0; 3]));
+        let (mut grid, _) = read(&block_to_obj(
+            &block,
+            &ObjOptions {
+                dual: false,
+                ..Default::default()
+            },
+        ));
+        // The same dual, but as exported with different axes: rotated a quarter turn about z.
+        let mut rotated = lattice_block(Lattice::Bcc, [6, 6, 6], 1.0, Pos([0.0; 3]));
+        for v in &mut rotated.dual_vertices {
+            *v = Pos([-v.y() + 0.37, v.x() + 0.11, v.z() + 0.23]);
+        }
+        let dual = block_to_obj(
+            &rotated,
+            &ObjOptions {
+                lines: Lines::None,
+                ..Default::default()
+            },
+        );
+        let start = std::time::Instant::now();
+        let r = grid.merge_dual_from_obj_string(&dual).expect("a mismatch is not a parse error");
+        assert_eq!(r.faces_matched, 0);
+        assert_eq!(r.faces_dropped, r.faces_total);
+        assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+        // The grid still has its points and edges.
+        assert_eq!(grid.points.len(), block.points.len());
+        assert_eq!(edge_count(&grid), block.shell1.len() + block.shell2.len());
+    }
+
+    #[test]
+    fn non_finite_coordinates_are_rejected() {
+        for bad in ["nan", "inf", "-inf"] {
+            let s = format!("o grid\nv 0 0 0\nv 1 0 0\nv {} 0 0\nl 1 2\nl 2 3\n", bad);
+            let err = VineyardsGridMesh::read_from_obj_string(&s).err().expect(bad);
+            assert!(err.contains("non-finite"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn object_with_faces_and_edges_is_rejected() {
+        // Lattice and Voronoi merged into one object (Blender "Objects as OBJ Groups", or a
+        // lattice exported with Delaunay faces on).
+        let block = lattice_block(Lattice::Sc, [2, 2, 2], 1.0, Pos([0.0; 3]));
+        let opts = ObjOptions {
+            lines: Lines::Shell1, // SC's second shell (face diagonals) shares no wall
+            ..Default::default()
+        };
+        let s = block_to_obj(&block, &opts).replace("o SC_voronoi\n", "");
+        let err = VineyardsGridMesh::read_from_obj_string(&s).err().expect("must be rejected");
+        assert!(err.contains("both") && err.contains("faces"), "{}", err);
+        // With `g` groups instead of `o` objects it parses like before.
+        let s = block_to_obj(&block, &opts).replace("\no ", "\ng ");
+        let (_, r) = read(&s);
+        assert_walls(&r, &block, &[(4, block.inner_walls())]);
+    }
+
+    #[test]
+    fn two_nearest_handles_small_sets_far_points_and_the_brute_force_fallback() {
+        // Two points: always those two.
+        let two = [Pos([0.0; 3]), Pos([1.0, 0.0, 0.0])];
+        let loc = PointLocator::new(&two);
+        assert_eq!(loc.two_nearest(Pos([0.9, 5.0, -3.0])), Some((1, 0)));
+
+        // A small cubic block: the shell scan cannot conclude for a point just outside the
+        // block, so the brute-force fallback runs.  It must return two distinct points, the
+        // nearest first.
+        let pts: Vec<Pos> = (0..4)
+            .flat_map(|i| (0..4).flat_map(move |j| (0..4).map(move |k| Pos([i as f64, j as f64, k as f64]))))
+            .collect();
+        let loc = PointLocator::new(&pts);
+        let (a, b) = loc.two_nearest(Pos([-0.5, 0.0, 0.0])).unwrap();
+        assert_ne!(a, b);
+        assert!(pts[a].dist(&Pos([0.0; 3])) < 1e-12, "nearest is the corner");
+        // second nearest: (0,1,0) or (0,0,1), at sqrt(0.25 + 1)
+        assert!((pts[b].dist(&Pos([-0.5, 0.0, 0.0])) - 1.25f64.sqrt()).abs() < 1e-12);
+        for c in [Pos([50.0, -20.0, 3.0]), Pos([1.5, 1.5, 1.5]), Pos([0.25, 3.0, 3.0])] {
+            let (a, b) = loc.two_nearest(c).unwrap();
+            assert_ne!(a, b);
+            let mut sorted: Vec<f64> = pts.iter().map(|p| p.dist(&c)).collect();
+            sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            assert!((pts[a].dist(&c) - sorted[0]).abs() < 1e-12);
+            assert!((pts[b].dist(&c) - sorted[1]).abs() < 1e-12);
+        }
+
+        // Collinear points.
+        let line: Vec<Pos> = (0..40).map(|i| Pos([i as f64 * 0.1, 0.0, 0.0])).collect();
+        let loc = PointLocator::new(&line);
+        let (a, b) = loc.two_nearest(Pos([2.04, 0.3, 0.0])).unwrap();
+        assert_eq!((a.min(b), a.max(b)), (20, 21));
+    }
+
+    #[test]
+    fn same_vertex_set_is_a_multiset_comparison() {
+        let (a, b, c, d) = (
+            Pos([0.0; 3]),
+            Pos([1.0, 0.0, 0.0]),
+            Pos([0.0, 1.0, 0.0]),
+            Pos([0.0, 0.0, 1.0]),
+        );
+        assert!(same_vertex_set(&[a, b, c], &[c, a, b], 1e-9));
+        assert!(!same_vertex_set(&[a, a, b, c], &[a, b, c, d], 1e-9));
+        assert!(!same_vertex_set(&[a, b, c, d], &[a, a, b, c], 1e-9));
+        let deduped = dedupe_vertices(&[a, b, a, c], 1e-9);
+        assert_eq!(deduped.len(), 3);
+        assert!(same_vertex_set(&deduped, &[a, b, c], 1e-9));
     }
 
     #[test]

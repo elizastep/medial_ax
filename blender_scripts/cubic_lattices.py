@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Cubic Lattices (SC / BCC / FCC) for medial-ax",
     "author": "medial-ax",
-    "version": (1, 3, 0),
-    "blender": (3, 0, 0),
+    "version": (1, 3, 1),
+    "blender": (3, 3, 0),
     "location": "View3D > Add > Mesh > Cubic Lattice   |   Sidebar (N) > Lattice",
     "description": "Generate simple-cubic, body-centred and face-centred cubic lattices "
                    "together with their Voronoi tessellation, optionally fitted to an "
@@ -11,13 +11,18 @@ bl_info = {
     "category": "Add Mesh",
 }
 
+# This add-on is two things: a general lattice visualiser (Delaunay mosaics, exploded cells,
+# sphere instances, BCC + FCC side by side) and the way we produce grids for mars-cli.
+#
 # Workflow for mars-cli:
 #   1. Select the input complex, then Add > Mesh > Cubic Lattice (or the N-panel "Lattice" tab).
 #   2. Tick "Fit to object" (and "Cull to inside" for closed meshes), pick BCC/FCC/SC, adjust the
-#      spacing.  Defaults already produce the lattice with all its bonds and the Voronoi walls.
+#      spacing.  The defaults are what mars-cli needs: Voronoi faces = All faces, Delaunay
+#      faces = None, Bonds = Voronoi walls.  The other face modes are for looking, not exporting.
 #   3. With the lattice selected, press "Export for mars (.obj)".  Both objects go into one file:
 #      `<kind>_lattice` (points + edges) and `<kind>_voronoi` (faces).  mars-cli links every
 #      Voronoi wall to the grid edge it bisects; run `mars-cli grid-check file.obj` to see how.
+#      Keep both objects visible and without modifiers when exporting; the operator checks.
 
 import itertools
 import math
@@ -27,6 +32,7 @@ import bmesh
 import mathutils
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        FloatVectorProperty, IntProperty, StringProperty)
+from mathutils.bvhtree import BVHTree
 
 
 # =====================================================================
@@ -53,7 +59,6 @@ BASIS_Y = {
 
 SHELL_1 = {'SC': 1.0, 'BCC': math.sqrt(3.0) / 2.0, 'FCC': math.sqrt(0.5)}
 SHELL_2 = {'SC': math.sqrt(2.0), 'BCC': 1.0, 'FCC': 1.0}
-COORDINATION = {'SC': 6, 'BCC': 8, 'FCC': 12}
 
 TET_FACES = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
 OCT_FACES = tuple((i, j, k) for i in (0, 1) for j in (2, 3) for k in (4, 5))
@@ -313,11 +318,6 @@ def voronoi_cells(kind, nx, ny, nz, a=1.0, centred=True):
     return verts, cells
 
 
-def wigner_seitz_verts(kind, a=1.0):
-    """Vertices of a single Voronoi cell centred at the origin, real coords."""
-    return [(a * v[0] / 4.0, a * v[1] / 4.0, a * v[2] / 4.0) for v in WS_Z[kind]]
-
-
 # ------------------------------------------------- shared face builders
 def _sub(p, q):
     return (p[0] - q[0], p[1] - q[1], p[2] - q[2])
@@ -402,49 +402,71 @@ def build_faces(cells, points, mode, shrink=0.0):
 #  Blender side
 # =====================================================================
 
-def _world_bbox(ob):
-    """Axis-aligned bounding box of an object in world space: (min, max)."""
+def _world_bbox(ob, depsgraph=None):
+    """Axis-aligned bounding box of an object in world space, modifiers applied: (min, max)."""
+    if depsgraph is not None:
+        ob = ob.evaluated_get(depsgraph)
     corners = [ob.matrix_world @ mathutils.Vector(c) for c in ob.bound_box]
     lo = tuple(min(c[k] for c in corners) for k in range(3))
     hi = tuple(max(c[k] for c in corners) for k in range(3))
     return lo, hi
 
 
-def average_longest_edge_length(ob):
-    """Mean over the triangles of `ob` of their longest edge, in world units.
+def average_longest_edge_length(ob, depsgraph=None):
+    """Mean over the (triangulated) faces of `ob` of their longest edge, in world units.
 
     Same heuristic as adaptive_grid.py: a density of 2 means two grid edges
-    per average triangle edge.
+    per average triangle edge.  Quads and n-gons are triangulated first, so
+    any mesh yields a spacing.
     """
     bm = bmesh.new()
-    bm.from_mesh(ob.data)
+    if depsgraph is not None:
+        bm.from_object(ob, depsgraph)
+    else:
+        bm.from_mesh(ob.data)
     bm.transform(ob.matrix_world)
-    longest = [max(e.calc_length() for e in f.edges)
-               for f in bm.faces if len(f.edges) == 3]
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    longest = [max(e.calc_length() for e in f.edges) for f in bm.faces]
     bm.free()
     return sum(longest) / len(longest) if longest else 0.0
 
 
-def point_in_mesh(ob, point):
-    """Ray-parity test of a world-space point against a closed mesh object.
+class InsideTester:
+    """Point-in-closed-mesh test against the evaluated geometry of `ob`, in world space.
 
-    Casts along the three axes and calls the point outside as soon as one
-    ray sees an even number of crossings (as adaptive_grid.py does).
+    Rays are cast from the point along the three axes and their crossings
+    counted; the point is inside if at least two of the three parities are
+    odd, so one bad triangle cannot flip the verdict.  Points within a small
+    distance of the surface count as inside, so a lattice point lying exactly
+    on a face is treated the same on every side of the object.  The BVH tree
+    is built once; the step past a hit is relative to the object's size.
     """
-    inv = ob.matrix_world.inverted()
-    origin = inv @ mathutils.Vector(point)
-    for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
-        direction = (inv.to_3x3() @ mathutils.Vector(axis)).normalized()
-        count, start = 0, origin.copy()
-        for _ in range(100000):
-            hit, location, _normal, _index = ob.ray_cast(start, direction)
-            if not hit:
-                break
-            count += 1
-            start = location + direction * 1e-5
-        if count % 2 == 0:
-            return False
-    return True
+
+    def __init__(self, ob, depsgraph):
+        self.inv = ob.matrix_world.inverted()
+        self.tree = BVHTree.FromObject(ob, depsgraph)
+        corners = [mathutils.Vector(c) for c in ob.evaluated_get(depsgraph).bound_box]
+        diagonal = max((p - q).length for p in corners for q in corners)
+        self.eps = 1e-6 * max(diagonal, 1e-12)
+        self.directions = [(self.inv.to_3x3() @ mathutils.Vector(axis)).normalized()
+                           for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
+
+    def __call__(self, point):
+        origin = self.inv @ mathutils.Vector(point)
+        _location, _normal, _index, distance = self.tree.find_nearest(origin)
+        if distance is not None and distance <= self.eps:
+            return True
+        odd = 0
+        for direction in self.directions:
+            count, start = 0, origin.copy()
+            while count < 100000:
+                location, _normal, _index, _distance = self.tree.ray_cast(start, direction)
+                if location is None:
+                    break
+                count += 1
+                start = location + direction * self.eps
+            odd += count % 2
+        return odd >= 2
 
 
 def _new_object(context, name, verts, edges=(), faces=(), location=(0.0, 0.0, 0.0)):
@@ -477,19 +499,22 @@ def _sphere_instances(context, parent, radius, subdivisions=2):
 def build_lattice(context, kind, a, nx, ny, nz, bonds, second_shell,
                   delaunay_mode, voronoi_mode, cell_shrink,
                   spheres, sphere_scale, origin,
-                  cull_object=None, outer_walls=True):
+                  cull_object=None, outer_walls=True, delaunay_bonds=False,
+                  depsgraph=None):
     """Create the lattice object, plus a Voronoi object if asked for.
 
     With `cull_object`, lattice points outside that (closed) mesh are
     dropped, together with every edge, Delaunay cell and Voronoi wall that
-    needs them.  Returns (object or None, counts).
+    needs them.  With `delaunay_bonds`, the edges are exactly the pairs of
+    points that share a Voronoi wall, read off the wall construction (no
+    distance tolerance involved); `bonds`/`second_shell` are then ignored.
+    Returns (object or None, counts).
     """
     all_pts = lattice_points(kind, nx, ny, nz, a)
     if cull_object is not None:
+        inside = InsideTester(cull_object, depsgraph or context.evaluated_depsgraph_get())
         keep = {i for i, p in enumerate(all_pts)
-                if point_in_mesh(cull_object, (p[0] + origin[0],
-                                               p[1] + origin[1],
-                                               p[2] + origin[2]))}
+                if inside((p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]))}
     else:
         keep = set(range(len(all_pts)))
     kept = sorted(keep)
@@ -508,15 +533,25 @@ def build_lattice(context, kind, a, nx, ny, nz, bonds, second_shell,
 
     verts, edges, faces = pts, [], []
 
+    walls = None
+    if voronoi_mode == 'MOSAIC' or delaunay_bonds:
+        # every wall once, welded, with the pair of sites it separates
+        walls = voronoi_walls(kind, nx, ny, nz, a, keep=keep, outer=outer_walls)
+
     if delaunay_mode != 'NONE':
         verts, faces = build_faces(remap_cells(delaunay_cells(kind, nx, ny, nz)), pts,
                                    delaunay_mode, cell_shrink)
 
-    if bonds and delaunay_mode != 'CELLS':
-        edges += neighbour_pairs(pts, SHELL_1[kind] * a, tol=1e-4 * a)
-        if second_shell:
-            edges += neighbour_pairs(pts, SHELL_2[kind] * a, tol=1e-4 * a)
-        if faces:                       # drop edges the faces already create
+    if delaunay_mode != 'CELLS':
+        if delaunay_bonds:
+            # exactly the pairs that share a wall: the Delaunay edges
+            edges += sorted((old_to_new[i], old_to_new[j])
+                            for i, j in walls[2] if j is not None)
+        elif bonds:
+            edges += neighbour_pairs(pts, SHELL_1[kind] * a, tol=1e-4 * a)
+            if second_shell:
+                edges += neighbour_pairs(pts, SHELL_2[kind] * a, tol=1e-4 * a)
+        if faces and edges:             # drop edges the faces already create
             used = set()
             for f in faces:
                 for m in range(len(f)):
@@ -538,9 +573,7 @@ def build_lattice(context, kind, a, nx, ny, nz, bonds, second_shell,
                   for v in vz]
             vfaces = vf
         elif voronoi_mode == 'MOSAIC':
-            # every wall once, welded, tagged (internally) with the two sites it separates
-            vv, vfaces, _pairs = voronoi_walls(kind, nx, ny, nz, a,
-                                               keep=keep, outer=outer_walls)
+            vv, vfaces, _pairs = walls
         else:
             vpts, vcells = voronoi_cells(kind, nx, ny, nz, a)
             vcells = [cell for i, cell in enumerate(vcells) if i in keep]
@@ -763,6 +796,7 @@ class MESH_OT_add_cubic_lattice(bpy.types.Operator):
             self.report({'ERROR'}, "Fit to object / Cull to inside need a target mesh object")
             return {'CANCELLED'}
         cull = target if self.cull_outside else None
+        depsgraph = context.evaluated_depsgraph_get()
 
         base = tuple(self.location)
         created, report = [], []
@@ -775,12 +809,12 @@ class MESH_OT_add_cubic_lattice(bpy.types.Operator):
             origin = list(base)
             if self.fit_to_object:
                 if self.spacing_mode == 'DENSITY':
-                    nn = average_longest_edge_length(target) / self.density
+                    nn = average_longest_edge_length(target, depsgraph) / self.density
                     if nn <= 0.0:
-                        self.report({'ERROR'}, "Target has no triangles; cannot derive a spacing")
+                        self.report({'ERROR'}, "Target has no faces; cannot derive a spacing")
                         return {'CANCELLED'}
                     a = nn / SHELL_1[kind]
-                lo, hi = _world_bbox(target)
+                lo, hi = _world_bbox(target, depsgraph)
                 pad = self.padding if self.padding > 0.0 else 0.5 * SHELL_1[kind] * a
                 nx, ny, nz = [max(1, int(math.ceil((hi[k] - lo[k] + 2.0 * pad) / a)))
                               for k in range(3)]
@@ -788,17 +822,13 @@ class MESH_OT_add_cubic_lattice(bpy.types.Operator):
             elif n and self.side_by_side:
                 origin[0] += self.nx * self.side + max(self.side, a)
 
-            # Delaunay bonds: exactly the pairs that share a Voronoi wall.  Only BCC has walls
-            # towards its second shell (the six axis neighbours).
-            bonds = self.bonds or self.delaunay_bonds
-            second_shell = (kind == 'BCC') if self.delaunay_bonds else self.second_shell
-
             obj, c = build_lattice(
                 context, kind, a, nx, ny, nz,
-                bonds, second_shell, self.delaunay_faces,
+                self.bonds, self.second_shell, self.delaunay_faces,
                 self.voronoi_faces, self.cell_shrink,
                 self.spheres, self.sphere_scale, tuple(origin),
-                cull_object=cull, outer_walls=self.outer_walls)
+                cull_object=cull, outer_walls=self.outer_walls,
+                delaunay_bonds=self.delaunay_bonds, depsgraph=depsgraph)
             if obj is None:
                 self.report({'WARNING'}, "%s: no lattice point is inside %r" % (kind, target.name))
                 continue
@@ -844,7 +874,7 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
         parenting was cleared."""
         objs = {o for o in context.selected_objects if o.type == 'MESH'}
         for o in list(objs):
-            objs.update(c for c in o.children if c.type == 'MESH')
+            objs.update(c for c in o.children if c.type == 'MESH' and "_voronoi" in c.name)
             if o.parent is not None and o.parent.type == 'MESH':
                 objs.add(o.parent)
             for a, b in (("_lattice", "_voronoi"), ("_voronoi", "_lattice")):
@@ -884,9 +914,15 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
         for o in objs:
             if "_lattice" in o.name and len(o.data.polygons):
                 self.report({'WARNING'},
-                            "%s has faces; mars-cli ignores faces on the lattice object and "
+                            "%s has faces; mars-cli rejects a lattice object with faces and "
                             "Blender drops the edges they cover. Regenerate with Delaunay "
                             "faces = None" % o.name)
+            if "_lattice" in o.name and o.modifiers:
+                self.report({'ERROR'},
+                            "%s has modifiers (%s). They would be applied on export and turn "
+                            "the grid into faces; disable or remove them first"
+                            % (o.name, ", ".join(m.name for m in o.modifiers)))
+                return {'CANCELLED'}
         context.view_layer.update()
         for o in objs:
             if o.parent in objs:
@@ -896,26 +932,45 @@ class EXPORT_OT_lattice_for_mars(bpy.types.Operator):
                     self.report({'WARNING'},
                                 "%s is not aligned with %s (moved on its own?); mars-cli "
                                 "will drop the misaligned walls" % (o.name, o.parent.name))
-        for o in context.view_layer.objects:
-            o.select_set(o in objs)
+        # Hidden objects cannot be selected and the exporter skips them, which would silently
+        # leave the Voronoi object out of the file.  Unhide for the export, restore afterwards.
+        def visibility(o):
+            try:
+                return o.hide_get(), o.hide_viewport
+            except RuntimeError:                        # not in this view layer
+                return None
+        saved = {o: visibility(o) for o in objs}
+        missing = sorted(o.name for o, v in saved.items() if v is None)
+        if missing:
+            self.report({'ERROR'}, "%s is not in the current view layer (excluded collection?); "
+                                   "cannot export it" % ", ".join(missing))
+            return {'CANCELLED'}
+        try:
+            for o in objs:
+                o.hide_viewport = False
+                o.hide_set(False)
+            context.view_layer.update()
+            for o in context.view_layer.objects:
+                o.select_set(o in objs)
+            unselected = sorted(o.name for o in objs if not o.select_get())
+            if unselected:
+                self.report({'ERROR'}, "Cannot select %s for export" % ", ".join(unselected))
+                return {'CANCELLED'}
 
-        path = bpy.path.ensure_ext(self.filepath, ".obj")
-        # No normals, UVs or materials, and no triangulation: mars-cli needs the walls whole.
-        # The axes default to X forward / Z up, the way we export complexes; both objects
-        # must be in the same frame as the complex.
-        if hasattr(bpy.ops.wm, "obj_export"):           # Blender 3.3+
+            path = bpy.path.ensure_ext(self.filepath, ".obj")
+            # No normals, UVs or materials, and no triangulation: mars-cli needs the walls
+            # whole.  The axes default to X forward / Z up, the way we export complexes; both
+            # objects must be in the same frame as the complex.  Modifiers are applied, which
+            # is why a lattice with modifiers was refused above.
             bpy.ops.wm.obj_export(
                 filepath=path, export_selected_objects=True, apply_modifiers=True,
                 export_normals=False, export_uv=False, export_materials=False,
                 export_triangulated_mesh=False,
                 forward_axis=self.forward_axis, up_axis=self.up_axis)
-        else:                                           # legacy Python exporter
-            bpy.ops.export_scene.obj(
-                filepath=path, use_selection=True, use_mesh_modifiers=True,
-                use_normals=False, use_uvs=False, use_materials=False,
-                use_triangles=False, use_edges=True,
-                axis_forward=self.forward_axis.replace("NEGATIVE_", "-"),
-                axis_up=self.up_axis.replace("NEGATIVE_", "-"))
+        finally:
+            for o, (hidden, hide_viewport) in saved.items():
+                o.hide_viewport = hide_viewport
+                o.hide_set(hidden)
 
         n_faces = sum(len(o.data.polygons) for o in objs)
         self.report({'INFO'}, "Wrote %s (%s forward, %s up): %s, %d Voronoi faces. Check it "
